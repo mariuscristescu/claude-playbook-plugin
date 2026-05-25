@@ -59,7 +59,7 @@ def evaluate_message(
     Evaluate a user message before or as it is processed.
 
     Called from: UserPromptSubmit hook (Claude), or after read_new_messages()
-    delivers a message (Codex/Gemini file-based path).
+    delivers a message (Codex/agy file-based path).
 
     Side effects: none. The adapter is responsible for writing to chat_log.md.
 
@@ -89,7 +89,7 @@ def evaluate_tool_call(
     Called from: PreToolUse hook (Claude only today).
 
     NOT called for Codex (no scriptable pre-tool hook — prefix_rule approval
-    only) or Gemini (hook model unverified). If called for a provider where
+    only) or agy (hook model unverified). If called for a provider where
     caps.has_pre_tool_hook is False, return Decision.skip().
 
     Current policy stub — full logic lives in task-gate-hook bash until T112:
@@ -155,7 +155,7 @@ def evaluate_stop(
     """
     Evaluate session end — the universal enforcement point.
 
-    Called from: Stop hook (Claude), AfterAgent (Gemini, unverified),
+    Called from: Stop hook (Claude), AfterAgent (agy, unverified),
     or session-end equivalent for other providers.
 
     This is the ONLY enforcement point available across all providers that

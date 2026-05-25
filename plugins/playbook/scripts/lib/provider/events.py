@@ -16,7 +16,7 @@ class MessageEvent:
     """A user message received by the agent.
 
     Source: UserPromptSubmit hook stdin (Claude), or read_new_messages() file
-    read (Codex/Gemini). Text is the cleaned message content — noise filtered
+    read (Codex/agy). Text is the cleaned message content — noise filtered
     (isMeta, slash commands, task-notifications, system-reminders stripped).
     """
     text: str
@@ -48,7 +48,7 @@ class ToolEvent:
 class StopEvent:
     """The agent session is ending.
 
-    Source: Stop hook (Claude), AfterAgent (Gemini), or equivalent session-end
+    Source: Stop hook (Claude), AfterAgent (agy), or equivalent session-end
     callback. This is the universal enforcement point available across all providers
     that have any hook support.
     """

@@ -7,9 +7,9 @@ import re
 import subprocess
 from pathlib import Path
 
-VERSION = "1.2.8"
+VERSION = "1.2.9"
 
-AGENT_PROCESS_NAMES = frozenset({"claude", "codex", "agy"})
+AGENT_PROCESS_NAMES = frozenset({"claude", "codex", "agy", "pi"})
 
 
 @functools.lru_cache(maxsize=1)

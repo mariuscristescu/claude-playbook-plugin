@@ -72,8 +72,7 @@ class ClaudeAdapter(ProviderAdapter):
         timeout_secs: int,
     ) -> str:
         import shutil
-        binary = shutil.which(self.binary_name())
-        if not binary:
+        if not shutil.which(self.binary_name()):
             return f"(error: {self.binary_name()} not found on PATH)"
         tools = "Read,Glob,Grep"
         if web_search:
@@ -84,15 +83,20 @@ class ClaudeAdapter(ProviderAdapter):
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
         env.pop("CLAUDE_PROJECT_DIR", None)
         model_arg = self._MODEL_MAP.get(model, model) if model else "sonnet"
-        cmd_list = [
-            binary, "-p", prompt,
+        # Bypass flag injected by provider.sandbox.run() — don't pass here.
+        agent_args = [
+            "-p", prompt,
             "--model", model_arg,
+            "--max-budget-usd", "2",
             "--tools", tools,
             "--allowedTools", tools,
             "--append-system-prompt", system_context,
         ]
-        result = subprocess.run(
-            cmd_list, cwd=str(self._project_root), env=env,
+        from provider import sandbox as _sandbox
+        result = _sandbox.run(
+            "claude", agent_args,
+            project_root=self._project_root,
+            env=env,
             capture_output=True, text=True, timeout=timeout_secs,
         )
         return result.stdout or "(no output)"

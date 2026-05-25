@@ -70,20 +70,28 @@ class CodexAdapter(ProviderAdapter):
         timeout_secs: int,
     ) -> str:
         import shutil
-        binary = shutil.which(self.binary_name())
-        if not binary:
+        if not shutil.which(self.binary_name()):
             return f"(error: {self.binary_name()} not found on PATH)"
         full_prompt = f"{system_context}\n\n---\n\n{prompt}"
-        cmd_list = [binary]
+        # Bypass flag (--dangerously-bypass-approvals-and-sandbox) inserted
+        # after `exec` by provider.sandbox._compose_agent_argv. Outer seatbelt
+        # / bwrap provides write containment instead of codex's internal
+        # `--sandbox read-only` (which would nest seatbelt-in-seatbelt on
+        # macOS and fail).
+        pre_exec: list[str] = []
         if web_search:
-            cmd_list.append("--search")
-        cmd_list += ["exec", "--ephemeral", "--skip-git-repo-check",
-                     "--sandbox", "read-only"]
+            pre_exec.append("--search")
+        agent_args = pre_exec + [
+            "exec", "--ephemeral", "--skip-git-repo-check",
+            "-s", "workspace-write",
+        ]
         if model:
-            cmd_list += ["-m", model]
-        cmd_list.append("-")
-        result = subprocess.run(
-            cmd_list, cwd=str(self._project_root),
+            agent_args += ["-m", model]
+        agent_args.append("-")
+        from provider import sandbox as _sandbox
+        result = _sandbox.run(
+            "codex", agent_args,
+            project_root=self._project_root,
             input=full_prompt, capture_output=True, text=True,
             timeout=timeout_secs,
         )
@@ -360,7 +368,7 @@ def _pid_walk_session_id(provider_names: list[str]) -> str:
     """Walk PID ancestry to find a provider process; return pid-<N>.
 
     Falls back to "default" if no provider process is found in ancestry.
-    Used only for Codex/Gemini — Claude provides session_id in stdin directly.
+    Used only for Codex/agy/pi — Claude provides session_id in stdin directly.
     """
     try:
         import os as _os

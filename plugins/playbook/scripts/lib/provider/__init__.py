@@ -2,8 +2,9 @@
 Provider harness architecture — cross-provider enforcement model.
 
 This package defines the shared data model and policy interface for Claude,
-Codex, and Gemini. All concrete provider logic lives in adapter subclasses;
-the policy functions here are pure over loaded facts.
+Codex, Antigravity (agy), and pi (local Qwen via oMLX). All concrete provider
+logic lives in adapter subclasses; the policy functions here are pure over
+loaded facts.
 
 Integration status: spec-only (T111). Bash hooks are unchanged.
 Wiring (hooks calling these functions) is T112.

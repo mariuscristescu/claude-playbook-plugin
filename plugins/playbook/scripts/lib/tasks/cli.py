@@ -1167,7 +1167,8 @@ def main():
         from provider.adapters.claude import ClaudeAdapter
         from provider.adapters.codex import CodexAdapter
         from provider.adapters.antigravity import AntigravityAdapter
-        PANEL_ADAPTERS = (ClaudeAdapter, CodexAdapter, AntigravityAdapter)
+        from provider.adapters.pi import PiAdapter
+        PANEL_ADAPTERS = (ClaudeAdapter, CodexAdapter, AntigravityAdapter, PiAdapter)
 
         judges = []  # list of (adapter_cls, variant)
         for cls in PANEL_ADAPTERS:
@@ -1267,12 +1268,14 @@ def main():
                 remaining_args.append(cmd_args[i])
                 i += 1
 
-        # Accept "agy" as a friendlier alias for "antigravity"
+        # Accept friendlier aliases: "agy" → "antigravity", "qwen" → "pi"
         if backend == "agy":
             backend = "antigravity"
-        if backend not in ("claude", "codex", "antigravity"):
+        elif backend == "qwen":
+            backend = "pi"
+        if backend not in ("claude", "codex", "antigravity", "pi"):
             print(f"Error: unknown backend '{backend}'", file=sys.stderr)
-            print("Supported: claude (default), codex, antigravity (alias: agy)", file=sys.stderr)
+            print("Supported: claude (default), codex, antigravity (alias: agy), pi (alias: qwen)", file=sys.stderr)
             sys.exit(1)
 
         if not remaining_args:
@@ -1335,71 +1338,30 @@ def main():
             env.pop("CLAUDE_CODE_ENTRYPOINT", None)
             env["PLAYBOOK_SESSION_ID"] = "judge"
 
-            # --dangerously-skip-permissions suppresses plugin hook registration —
-            # intentional: judge is a read-only evaluator (seatbelt-sandboxed on
-            # macOS), not a task worker. PLAYBOOK_SESSION_ID=judge above lets
-            # hooks identify judge sessions if needed.
+            # Bypass flag injected by provider.sandbox.run() — don't pass here.
+            # The judge is a read-only evaluator sandboxed via provider.sandbox
+            # (write containment via seatbelt/bwrap). PLAYBOOK_SESSION_ID=judge
+            # above lets hooks identify judge sessions if needed.
             claude_args = [
-                claude_bin, "-p",
-                "--dangerously-skip-permissions",
+                "-p",
                 "--max-budget-usd", "2",
                 "--append-system-prompt", system_context,
                 prompt,
             ]
 
-            # Wrap in seatbelt sandbox on macOS (write containment)
-            # Skip if already inside sandbox (nested sandbox-exec is not allowed)
-            import platform
-            already_sandboxed = (
-                os.environ.get("PLAYBOOK_SANDBOXED") == "1"
-                or str(project_path).startswith("/tmp/eval-")
-                or str(project_path).startswith("/private/tmp/eval-")
-            )
-            if not already_sandboxed and platform.system() == "Darwin" and shutil.which("sandbox-exec"):
-                git_dir = subprocess.run(
-                    ["git", "rev-parse", "--git-dir"],
-                    cwd=str(project_path), capture_output=True, text=True,
-                ).stdout.strip()
-                if git_dir:
-                    git_dir = str(Path(git_dir).resolve())
-                    proj_dir = str(project_path.resolve())
-                    home_dir = str(Path.home())
-                    profile = (
-                        '(version 1)\n(allow default)\n'
-                        '(deny file-write*\n'
-                        '    (require-all\n'
-                        f'        (require-not (subpath "{proj_dir}"))\n'
-                        '        (require-not (subpath "/tmp"))\n'
-                        '        (require-not (subpath "/private/tmp"))\n'
-                        '        (require-not (subpath "/var/folders"))\n'
-                        '        (require-not (subpath "/private/var/folders"))\n'
-                        f'        (require-not (regex #"^{home_dir}/\\.claude"))\n'
-                        f'        (require-not (subpath "{home_dir}/.cache"))\n'
-                        f'        (require-not (subpath "{home_dir}/.local"))\n'
-                        f'        (require-not (subpath "{home_dir}/Library"))\n'
-                        '        (require-not (subpath "/dev"))\n'
-                        '    )\n'
-                        ')\n'
-                        f'(deny file-write* (subpath "{git_dir}"))'
-                    )
-                    cmd_list = ["sandbox-exec", "-p", profile] + claude_args
-                else:
-                    cmd_list = claude_args
-            else:
-                cmd_list = claude_args
-
+            from provider import sandbox as _sandbox
             print(f"Running {review_label} (claude) on {task_path}...", flush=True)
-            result = subprocess.run(
-                cmd_list,
-                cwd=str(project_path),
+            result = _sandbox.run(
+                "claude",
+                claude_args,
+                project_root=project_path,
                 env=env,
                 capture_output=True,
                 text=True,
             )
 
         elif backend == "codex":
-            codex_bin = shutil.which("codex")
-            if not codex_bin:
+            if not shutil.which("codex"):
                 print("Error: 'codex' not found on PATH", file=sys.stderr)
                 print("Install: https://github.com/openai/codex", file=sys.stderr)
                 sys.exit(1)
@@ -1409,8 +1371,10 @@ def main():
             full_prompt = f"{system_context}\n\n---\n\n{prompt}"
 
             codex_log = task_file.parent / "judge-codex.log"
-            cmd_list = [
-                codex_bin, "exec",
+            # Bypass flag (--dangerously-bypass-approvals-and-sandbox) inserted
+            # after `exec` by provider.sandbox._compose_agent_argv.
+            codex_args = [
+                "exec",
                 "-s", "workspace-write",
                 "--ephemeral",
                 "-C", str(project_path),
@@ -1418,18 +1382,22 @@ def main():
                 "-",  # read prompt from stdin
             ]
 
+            codex_env = os.environ.copy()
+            codex_env["PLAYBOOK_SESSION_ID"] = "judge"
+
+            from provider import sandbox as _sandbox
             print(f"Running {review_label} (codex) on {task_path}...", flush=True)
-            result = subprocess.run(
-                cmd_list,
-                cwd=str(project_path),
+            result = _sandbox.run(
+                "codex", codex_args,
+                project_root=project_path,
+                env=codex_env,
                 input=full_prompt,
                 capture_output=True,
                 text=True,
             )
 
-        else:  # antigravity (agy)
-            agy_bin = shutil.which("agy")
-            if not agy_bin:
+        elif backend == "antigravity":  # agy
+            if not shutil.which("agy"):
                 print("Error: 'agy' not found on PATH", file=sys.stderr)
                 sys.exit(1)
 
@@ -1440,18 +1408,54 @@ def main():
 
             # agy v1.0.2 quirks: --print mode ignores cwd, needs --add-dir;
             # no -m/--model flag yet (uses whatever the agy UI has set).
-            cmd_list = [
-                agy_bin,
+            # Bypass (--dangerously-skip-permissions) prepended by sandbox.
+            agy_args = [
                 "--add-dir", str(project_path),
                 "--print", full_prompt,
                 "--print-timeout", "300s",
-                "--dangerously-skip-permissions",
             ]
 
+            agy_env = os.environ.copy()
+            agy_env["PLAYBOOK_SESSION_ID"] = "judge"
+
+            from provider import sandbox as _sandbox
             print(f"Running {review_label} (agy) on {task_path}...", flush=True)
-            result = subprocess.run(
-                cmd_list,
-                cwd=str(project_path),
+            result = _sandbox.run(
+                "agy", agy_args,
+                project_root=project_path,
+                env=agy_env,
+                capture_output=True,
+                text=True,
+            )
+
+        else:  # pi (local Qwen via oMLX)
+            if not (shutil.which("pi") or shutil.which("omlx")):
+                print("Error: neither 'pi' nor 'omlx' found on PATH", file=sys.stderr)
+                print("Install: oMLX app (https://omlx.app/) or pi CLI", file=sys.stderr)
+                sys.exit(1)
+
+            prompt = prompt_fn(task_path, inline_context=True)
+
+            # Pi has no system prompt convention — append-system-prompt threads
+            # the system context. --no-context-files skips AGENTS.md/CLAUDE.md
+            # auto-load so the judge isn't biased by project conventions.
+            # --provider oss points at the local oMLX endpoint (127.0.0.1:8000).
+            pi_args = [
+                "-p", prompt,
+                "--provider", "oss",
+                "--no-context-files",
+                "--append-system-prompt", system_context,
+            ]
+
+            pi_env = os.environ.copy()
+            pi_env["PLAYBOOK_SESSION_ID"] = "judge"
+
+            from provider import sandbox as _sandbox
+            print(f"Running {review_label} (pi) on {task_path}...", flush=True)
+            result = _sandbox.run(
+                "pi", pi_args,
+                project_root=project_path,
+                env=pi_env,
                 capture_output=True,
                 text=True,
             )
@@ -1466,6 +1470,7 @@ def main():
             "claude": "judge.log",
             "codex": "judge-codex.log",
             "antigravity": "judge-agy.log",
+            "pi": "judge-pi.log",
         }.get(backend, "judge.log")
         judge_log = task_file.parent / log_name
         output = (result.stdout or "").strip()

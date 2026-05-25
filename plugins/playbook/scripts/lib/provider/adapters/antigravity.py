@@ -78,23 +78,23 @@ class AntigravityAdapter(ProviderAdapter):
         timeout_secs: int,
     ) -> str:
         import shutil
-        binary = shutil.which(self.binary_name())
-        if not binary:
+        if not shutil.which(self.binary_name()):
             return f"(error: {self.binary_name()} not found on PATH)"
         full_prompt = f"{system_context}\n\n---\n\n{prompt}"
         # agy v1.0.2 quirks:
         #  - takes prompt via --print/-p flag (not stdin)
         #  - --print mode ignores cwd; needs --add-dir to expose the project tree
         #  - --print-timeout accepts Go-style duration strings (e.g. "300s")
-        cmd_list = [
-            binary,
+        # Bypass flag (--dangerously-skip-permissions) prepended by sandbox.
+        agent_args = [
             "--add-dir", str(self._project_root),
             "--print", full_prompt,
             "--print-timeout", f"{timeout_secs}s",
-            "--dangerously-skip-permissions",
         ]
-        result = subprocess.run(
-            cmd_list, cwd=str(self._project_root),
+        from provider import sandbox as _sandbox
+        result = _sandbox.run(
+            "agy", agent_args,
+            project_root=self._project_root,
             capture_output=True, text=True, timeout=timeout_secs + 30,
         )
         return result.stdout or "(no output)"

@@ -1,0 +1,47 @@
+#!/bin/bash
+# bin/playbook-pi — launch pi (via oMLX) with a per-session Playbook ID.
+#
+# Usage: playbook-pi [pi-args...]
+#
+# Generates PLAYBOOK_SESSION_ID, provisions the session directory, then execs
+# `omlx launch pi` so pi inherits the env. oMLX writes ~/.pi/agent/models.json
+# and settings.json pointing at the local Qwen MLX server (127.0.0.1:8000/v1),
+# then os.execvpe's pi — the env propagates through.
+#
+# Canonical user-facing entry point. See src/provider/adapters/pi.py
+# launch_interactive() for the programmatic equivalent (assumes env pre-set).
+
+set -e
+
+# Find project root (directory containing .agent/tasks/)
+find_project_root() {
+    local dir="$PWD"
+    while [ "$dir" != "/" ]; do
+        if [ -d "$dir/.agent/tasks" ]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    echo ""
+}
+
+PROJECT_ROOT="$(find_project_root)"
+
+SESSION_ID="pid-$$"
+export PLAYBOOK_SESSION_ID="$SESSION_ID"
+export PLAYBOOK_PROJECT_ROOT="$PROJECT_ROOT"
+
+if [ -n "$PROJECT_ROOT" ]; then
+    mkdir -p "$PROJECT_ROOT/.agent/sessions/$SESSION_ID"
+fi
+
+if command -v omlx >/dev/null 2>&1; then
+    exec omlx launch pi "$@"
+elif command -v pi >/dev/null 2>&1; then
+    exec pi "$@"
+else
+    echo "Error: neither omlx nor pi found on PATH" >&2
+    echo "Install: oMLX app (https://omlx.app/) or pi CLI" >&2
+    exit 1
+fi
