@@ -134,13 +134,19 @@ def codex_config_path(home_dir: Path | None = None) -> Path:
 
 
 def enable_codex_hooks_feature(config_path: Path) -> bool:
-    """Ensure [features] codex_hooks = true exists, preserving unrelated content.
+    """Ensure [features] hooks = true exists, preserving unrelated content.
+
+    Codex renamed the feature flag `codex_hooks` -> `hooks` (stable as of
+    codex 0.141; the old `codex_hooks` is deprecated and absent from
+    `codex features list`, and `plugin_hooks` was removed entirely). We write
+    `hooks = true` and migrate any legacy `codex_hooks` line in the [features]
+    block so upgrading installs stop riding the deprecated alias.
 
     Returns True when the file content changed.
     """
     config_path.parent.mkdir(parents=True, exist_ok=True)
     if not config_path.exists():
-        config_path.write_text("[features]\ncodex_hooks = true\n", encoding="utf-8")
+        config_path.write_text("[features]\nhooks = true\n", encoding="utf-8")
         return True
 
     original = config_path.read_text(encoding="utf-8")
@@ -169,18 +175,28 @@ def enable_codex_hooks_feature(config_path: Path) -> bool:
             new_text += "\n"
         if new_text:
             new_text += "\n"
-        new_text += "[features]\ncodex_hooks = true\n"
+        new_text += "[features]\nhooks = true\n"
     else:
         updated = list(lines)
-        found_key = False
+        # Within [features]: set `hooks = true`; migrate/drop legacy `codex_hooks`.
+        hooks_idx = None
+        legacy_idxs = []
         for idx in range(features_start + 1, features_end):
-            stripped = updated[idx].strip()
-            if stripped.startswith("codex_hooks"):
-                updated[idx] = "codex_hooks = true"
-                found_key = True
-                break
-        if not found_key:
-            updated.insert(features_end, "codex_hooks = true")
+            key = updated[idx].split("=", 1)[0].strip()
+            if key == "hooks":
+                hooks_idx = idx
+            elif key == "codex_hooks":
+                legacy_idxs.append(idx)
+        if hooks_idx is not None:
+            updated[hooks_idx] = "hooks = true"
+            for idx in sorted(legacy_idxs, reverse=True):
+                del updated[idx]
+        elif legacy_idxs:
+            updated[legacy_idxs[0]] = "hooks = true"
+            for idx in sorted(legacy_idxs[1:], reverse=True):
+                del updated[idx]
+        else:
+            updated.insert(features_end, "hooks = true")
         new_text = "\n".join(updated)
         if original.endswith("\n"):
             new_text += "\n"
