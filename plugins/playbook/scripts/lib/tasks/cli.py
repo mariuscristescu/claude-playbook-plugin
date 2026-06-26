@@ -1651,6 +1651,88 @@ def main():
                     text = text[:max_line] + "..."
                 print(f"[{msg_id}] {text}")
 
+    elif cmd == "intent":
+        # Vertical retro: 4 blind intent extractions over one task's layers.
+        if not cmd_args:
+            print("Error: 'intent' requires a task number", file=sys.stderr)
+            print("Usage: tasks intent <number> [--chat-file P] [--base REF --head REF] "
+                  "[--collect-only] [--timeout S]", file=sys.stderr)
+            sys.exit(1)
+
+        task_num = cmd_args[0]
+        if task_num.isdigit():
+            task_num = task_num.zfill(3)
+        chat_file = base = head = None
+        collect_only = False
+        timeout_secs = 300
+        i = 1
+        while i < len(cmd_args):
+            a = cmd_args[i]
+            if a == "--chat-file" and i + 1 < len(cmd_args):
+                chat_file = Path(cmd_args[i + 1]); i += 2
+            elif a == "--base" and i + 1 < len(cmd_args):
+                base = cmd_args[i + 1]; i += 2
+            elif a == "--head" and i + 1 < len(cmd_args):
+                head = cmd_args[i + 1]; i += 2
+            elif a == "--collect-only":
+                collect_only = True; i += 1
+            elif a == "--timeout" and i + 1 < len(cmd_args):
+                timeout_secs = int(cmd_args[i + 1]); i += 2
+            else:
+                print(f"Error: unknown option for intent: {a}", file=sys.stderr)
+                sys.exit(1)
+
+        if bool(base) != bool(head):
+            print("Error: --base and --head must be given together (an explicit range)",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        from tasks.intent import (
+            collect_all, run_extractions, make_default_runner,
+            write_run, find_task_dir, new_run_id, last_intent_entry, LAYERS,
+        )
+        project_path = find_project_root()
+        agent_dir = resolve_agent_dir(project_path)
+        task_dir = find_task_dir(agent_dir / "tasks", task_num)
+        if task_dir is None:
+            print(f"Error: no task {task_num} under {agent_dir / 'tasks'}", file=sys.stderr)
+            sys.exit(1)
+
+        slices = collect_all(project_path, agent_dir, task_dir, task_num,
+                             chat_file=chat_file, base=base, head=head)
+        print(f"Intent review — task {task_num} ({task_dir.name})")
+        for layer in LAYERS:
+            s = slices[layer]
+            print(f"  {layer:7} {'✓' if s.available else '✗'}  {s.provenance}")
+        avail = [l for l in LAYERS if slices[l].available]
+        if not avail:
+            print("Error: no available evidence on any layer — nothing to infer. "
+                  "Pass --chat-file and/or --base/--head.", file=sys.stderr)
+            sys.exit(1)
+
+        run_id = new_run_id()
+        if collect_only:
+            from tasks.intent import build_prompt
+            reports = {l: (build_prompt(slices[l]) if slices[l].available
+                           else f"# Intent inferred from {l}\n\n_(no evidence — "
+                                f"{slices[l].provenance})_\n") for l in LAYERS}
+            print("\n(--collect-only: wrote prompts, skipped model calls)")
+        else:
+            print(f"\nRunning {len(avail)} blind extraction(s) "
+                  f"(default judge, {timeout_secs}s each)...", flush=True)
+            reports = run_extractions(slices, make_default_runner(
+                project_path, timeout_secs=timeout_secs))
+
+        run_dir = write_run(task_dir, slices, reports, run_id=run_id)
+        rel = run_dir.relative_to(project_path)
+        print(f"\nReports written: {rel}/")
+        print(f"Grading sheet:   {rel}/review.md")
+        prior = last_intent_entry(project_path / "INTENT.md", task_num)
+        if prior:
+            print("Prior validated intent exists — reconcile as a DELTA against INTENT.md.")
+        print("\nNext: read review.md with the user, grade the seams, then append "
+              "vetted intent to INTENT.md (the /intent command drives this).")
+
     elif cmd == "timeline":
         project_path = find_project_root()
         bash_history = resolve_agent_dir(project_path) / "bash_history"

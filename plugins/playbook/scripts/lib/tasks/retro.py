@@ -337,7 +337,7 @@ def generate_retro_task(
     lines.append(f"**Gates:** {total_checked}/{total_gates} checked, "
                  f"{total_bare} bare ({total_bare*100//max(total_checked,1)}%), "
                  f"{total_parked} parked items")
-    lines.append(f"**Mind map:** {total_mm_size:,} bytes ({len(mindmap)} nodes, target <10,000)")
+    lines.append(f"**Mind map:** {total_mm_size:,} bytes ({len(mindmap)} nodes, load budget 25,000)")
     lines.append("")
 
     # Task inventory table
@@ -432,13 +432,13 @@ def generate_retro_task(
     # Phase 5: Mind map revision
     lines.append("## Phase 5: Mind Map Revision")
     lines.append("")
-    lines.append(f"> Current: {total_mm_size:,} bytes, {len(mindmap)} nodes. Target: <10,000 bytes.")
+    lines.append(f"> Current: {total_mm_size:,} bytes, {len(mindmap)} nodes. Load budget: 25,000 bytes (_load_mind_map).")
     lines.append("> Keep only what reduces future cost — reasoning, decisions, relationships.")
     lines.append("> Remove what's cheaply derivable from git log, grep, or reading code.")
     lines.append("")
     lines.append("- [ ] For each mind map node: does it carry information that would cost an agent significant time to rediscover? If not, compress or remove.")
     lines.append("- [ ] Are there new decisions, patterns, or relationships from this window that should be added?")
-    lines.append("- [ ] Apply edits. Verify total <10KB.")
+    lines.append("- [ ] Apply edits. Keep MIND_MAP.md ≤25KB (the load budget); push full node text to MIND_MAP_OVERFLOW.md.")
     lines.append("")
 
     # Phase 6: Findings
