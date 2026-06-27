@@ -24,7 +24,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from ..adapter import ProviderAdapter
+from ..adapter import ProviderAdapter, Invocation
 from ..capabilities import ProviderCapabilities, SessionFacts
 from ..events import MessageEvent, ToolEvent, StopEvent
 from ..policy import Decision
@@ -70,6 +70,24 @@ class ClaudeAdapter(ProviderAdapter):
     def panel_variants(cls) -> list[Optional[str]]:
         return list(cls._DEFAULT_PANEL_VARIANTS)
 
+    def headless_argv(
+        self,
+        prompt: str,
+        model: Optional[str],
+        *,
+        context: str = "",
+        bare: bool = False,
+        stream: bool = False,
+    ) -> Invocation:
+        # Bypass flag injected by provider.sandbox.run() — don't pass here.
+        model_arg = self._MODEL_MAP.get(model, model) if model else "sonnet"
+        argv = ["-p", prompt, "--model", model_arg]
+        if context and not bare:
+            argv += ["--append-system-prompt", context]
+        if stream:
+            argv += ["--output-format", "stream-json", "--include-partial-messages"]
+        return Invocation(argv)
+
     def run_headless_judge(
         self,
         prompt: str,
@@ -91,15 +109,12 @@ class ClaudeAdapter(ProviderAdapter):
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
         env.pop("CLAUDE_PROJECT_DIR", None)
         env["PLAYBOOK_SESSION_ID"] = self._session_id or "judge"
-        model_arg = self._MODEL_MAP.get(model, model) if model else "sonnet"
-        # Bypass flag injected by provider.sandbox.run() — don't pass here.
-        agent_args = [
-            "-p", prompt,
-            "--model", model_arg,
+        inv = self.headless_argv(prompt, model, context=system_context)
+        # Judge-only extras layered on the core invocation.
+        agent_args = inv.argv + [
             "--max-budget-usd", "2",
             "--tools", tools,
             "--allowedTools", tools,
-            "--append-system-prompt", system_context,
         ]
         from provider import sandbox as _sandbox
         result = _sandbox.run(

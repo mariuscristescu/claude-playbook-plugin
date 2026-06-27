@@ -16,7 +16,7 @@ AGENT_PROCESS_NAMES = frozenset({"claude", "codex", "agy", "pi"})
 def find_agent_root_pid() -> int | None:
     """Walk parent process tree, return PID of the highest agent ancestor.
 
-    Identifies claude/codex/agy processes by `comm` (basename, no args).
+    Identifies claude/codex/agy/pi processes by `comm` (basename, no args).
     Returns None if no agent found within 20 hops or if `ps` is unavailable.
     Used as fallback when PLAYBOOK_SESSION_ID env var isn't propagated —
     Python and bash both walk the same tree and converge on the same PID.

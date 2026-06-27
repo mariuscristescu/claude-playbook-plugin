@@ -17,7 +17,7 @@ Make surfaces machine- and human-readable:
 - **State as JSON/JSONL on disk** (`cat`/`jq`-able); **SQLite** for queryable state
 - **Logs to a known `logs/<id>.log`**
 - **Structured logging**
-- **`.mission-control.yaml`** — id/kind/services/URLs/probes/logs
+- **`.mission-control.yaml`** — a machine-readable project descriptor (at minimum `version` + a `project` description; extend with services/URLs/probes/logs as the project grows) so a workspace tool can discover how to observe it
 - **`app.sh status` + `logs`** — read-only "what's running"
 - **A health probe** (`/health` or a `check` verb)
 - **A preflight script** — before a server/batch job starts, validate required env vars, API keys, reachable endpoints, and config; fail loud with the missing item named, so failure is at second 0, not mid-run

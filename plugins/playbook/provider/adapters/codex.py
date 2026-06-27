@@ -30,7 +30,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from ..adapter import ProviderAdapter
+from ..adapter import ProviderAdapter, Invocation
 from ..capabilities import ProviderCapabilities, SessionFacts
 from ..codex_hooks import codex_config_path, enable_codex_hooks_feature, install_project_hooks
 from ..policy import Decision
@@ -72,22 +72,9 @@ class CodexAdapter(ProviderAdapter):
         import shutil
         if not shutil.which(self.binary_name()):
             return f"(error: {self.binary_name()} not found on PATH)"
-        full_prompt = f"{system_context}\n\n---\n\n{prompt}"
-        # Bypass flag (--dangerously-bypass-approvals-and-sandbox) inserted
-        # after `exec` by provider.sandbox._compose_agent_argv. Outer seatbelt
-        # / bwrap provides write containment instead of codex's internal
-        # `--sandbox read-only` (which would nest seatbelt-in-seatbelt on
-        # macOS and fail).
-        pre_exec: list[str] = []
-        if web_search:
-            pre_exec.append("--search")
-        agent_args = pre_exec + [
-            "exec", "--ephemeral", "--skip-git-repo-check",
-            "-s", "workspace-write",
-        ]
-        if model:
-            agent_args += ["-m", model]
-        agent_args.append("-")
+        inv = self.headless_argv(prompt, model, context=system_context)
+        # Judge-only extra: web search prepended before `exec`.
+        agent_args = (["--search"] if web_search else []) + inv.argv
         env = os.environ.copy()
         env["PLAYBOOK_SESSION_ID"] = self._session_id or "judge"
         from provider import sandbox as _sandbox
@@ -95,10 +82,30 @@ class CodexAdapter(ProviderAdapter):
             "codex", agent_args,
             project_root=self._project_root,
             env=env,
-            input=full_prompt, capture_output=True, text=True,
+            input=inv.stdin, capture_output=True, text=True,
             timeout=timeout_secs,
         )
         return _sandbox.format_judge_output(result)
+
+    def headless_argv(
+        self,
+        prompt: str,
+        model: Optional[str],
+        *,
+        context: str = "",
+        bare: bool = False,
+        stream: bool = False,
+    ) -> Invocation:
+        # codex reads its prompt from stdin (argv ends in "-"); context is
+        # joined into the stdin payload. Bypass flag inserted after `exec` by
+        # provider.sandbox._compose_agent_argv; outer seatbelt/bwrap provides
+        # write containment (codex's internal --sandbox would nest and fail).
+        full_prompt = prompt if (bare or not context) else f"{context}\n\n---\n\n{prompt}"
+        argv = ["exec", "--ephemeral", "--skip-git-repo-check", "-s", "workspace-write"]
+        if model:
+            argv += ["-m", model]
+        argv.append("-")
+        return Invocation(argv, stdin=full_prompt)
 
     # ── Identity ─────────────────────────────────────────────────────────────
 

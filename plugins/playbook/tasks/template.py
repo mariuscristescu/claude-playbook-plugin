@@ -427,6 +427,7 @@ Then **ask the user** what they want to work on. Don't autonomously pick a task.
 .claude/bin/tasks list [--pending]           # task overview
 .claude/bin/tasks status                     # current gate position
 .claude/bin/tasks bootstrap                  # orientation: mind map + skills + pending
+.claude/bin/sandbox --prompt "..." [--agent claude|codex|agy|pi] [--bare]  # run a contained headless subagent; `--help` for flags
 ```
 
 ## Don't
@@ -635,12 +636,17 @@ Commands:
   global-retro-collect --since DATE [--machine NAME] [--out DIR] [--format zip|tgz] ROOT [ROOT...]
                       Collect Playbook artifacts for a global retro archive
   context <N>         Extract chat messages for a task
+  log [N] [--width W]  Compact one-line-per-message chat log (last N, body cropped to W; default all/500)
   prepare-merge [--target <branch>] [--dry-run]
                       Renumber tasks, re-sequence chat_log, report MIND_MAP collisions
                       so the branch merges cleanly into target (default: main)
   doctor              Harness health check
   bootstrap           Load mind map + skills + pending tasks
   init                Create CLAUDE.md for this project
+
+Sandboxed subagents (separate CLI):
+  .claude/bin/sandbox --prompt "..." [--agent claude|codex|agy|pi] [--bare] [--stream]
+                      Run a contained headless agent (write-containment); `--help` for flags
 
 Task types: {types}
 

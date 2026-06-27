@@ -10,9 +10,15 @@ or codex.
 
 Bootstrap file: AGENTS.md (pi reads it the same way codex does).
 
-Hook surface: pi v0.73.0 has no plugin or hook system — install_hooks is a
-no-op and pi sessions rely on the outer sandbox for containment, not on
-in-process hooks. When upstream ships hooks, wire them here.
+Hook surface: pi (0.73+, verified live on 0.80.2) HAS an extension system
+(`pi -e <adapter.ts>`). The Playbook bridge `scripts/playbook-pi-hook-adapter.ts`
+maps pi lifecycle events to the existing bash hooks, giving a pi session real
+PreToolUse gate-blocking, post-tool gate echo, and prompt logging — the same
+prevention loop claude/codex/agy have. It is loaded by the `bin/playbook-pi`
+wrapper via `-e`, so hook install is wrapper-owned (no global config mutation);
+`install_hooks` only provisions the per-project `<agent-dir>/pi/` config. No
+blocking Stop equivalent yet (pi can't refuse to end a turn) — anti-walk-away
+enforcement is deferred (Phase 2).
 
 Headless invocation: `pi -p "<prompt>"` (or `--print`). Optional flags we
 care about: `--provider <name>` (default `google`; we usually want `oss`
@@ -35,7 +41,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from ..adapter import ProviderAdapter
+from ..adapter import ProviderAdapter, Invocation
 from ..capabilities import ProviderCapabilities
 
 
@@ -100,28 +106,40 @@ class PiAdapter(ProviderAdapter):
         # direct pi if omlx is missing.
         if shutil.which("omlx") is None and shutil.which("pi") is None:
             return f"(error: neither omlx nor pi found on PATH)"
-        # Resolve variant label → (--provider, --model). Unknown labels are
-        # treated as raw model identifiers routed via openrouter (so callers
-        # can pass `provider/model` strings ad-hoc).
-        provider, model_id = self._VARIANT_MAP.get(model, ("openrouter", model))
-        agent_args = [
-            "-p", prompt,
-            "--provider", provider,
-            "--no-context-files",
-            "--append-system-prompt", system_context,
-        ]
-        if model_id:
-            agent_args[2:2] = ["--model", model_id]
+        inv = self.headless_argv(prompt, model, context=system_context)
         env = os.environ.copy()
         env["PLAYBOOK_SESSION_ID"] = self._session_id or "judge"
         from provider import sandbox as _sandbox
         result = _sandbox.run(
-            "pi", agent_args,
+            "pi", inv.argv,
             project_root=self._project_root,
             env=env,
             capture_output=True, text=True, timeout=timeout_secs,
         )
         return _sandbox.format_judge_output(result)
+
+    def headless_argv(
+        self,
+        prompt: str,
+        model: Optional[str],
+        *,
+        context: str = "",
+        bare: bool = False,
+        stream: bool = False,
+    ) -> Invocation:
+        # Resolve variant label → (--provider, --model). Unknown labels are
+        # treated as raw model identifiers routed via openrouter (so callers
+        # can pass `provider/model` strings ad-hoc). pi is model-agnostic:
+        # "which model" is just these flags, not a different binary.
+        provider, model_id = self._VARIANT_MAP.get(model, ("openrouter", model))
+        argv = ["-p", prompt, "--provider", provider, "--no-context-files"]
+        if model_id:
+            argv += ["--model", model_id]
+        if context and not bare:
+            argv += ["--append-system-prompt", context]
+        if stream:
+            argv += ["--mode", "json"]
+        return Invocation(argv)
 
     # ── Identity ─────────────────────────────────────────────────────────────
 
@@ -148,14 +166,54 @@ class PiAdapter(ProviderAdapter):
             target.write_text(agents_md_template(), encoding="utf-8")
 
     # ── Hooks ─────────────────────────────────────────────────────────────────
-    # pi v0.73.0 has no plugin/hook system. install_hooks/uninstall_hooks are
-    # no-ops; outer sandbox is the only containment.
+    # pi (0.73+) HAS an extension system (`pi -e <adapter.ts>`). The Playbook
+    # hook bridge (`scripts/playbook-pi-hook-adapter.ts`) maps pi lifecycle
+    # events to the existing bash hooks: tool_call→task-gate-hook (a `{block}`
+    # return = a real PreToolUse deny), tool_result→state-echo-hook (gate echo),
+    # input→chat-log-hook, session_start/shutdown→session hooks. The adapter is
+    # loaded by the `bin/playbook-pi` wrapper via `-e`, so hook installation is
+    # *wrapper-owned* and needs no global config mutation. install_hooks only
+    # provisions the per-project pi config dir + model allow-list file under the
+    # resolved agent dir; uninstall removes it. (Verified live, pi 0.80.2, T145.)
+
+    @staticmethod
+    def _shipped_models_json() -> Optional[Path]:
+        """Locate the shipped oMLX model allow-list (`playbook-pi-omlx-models.json`).
+        Lives in `scripts/` next to the hook scripts in both dev and installed
+        layouts — walk up from this module looking for it."""
+        here = Path(__file__).resolve()
+        for parent in here.parents:
+            cand = parent / "scripts" / "playbook-pi-omlx-models.json"
+            if cand.exists():
+                return cand
+        return None
+
+    def _pi_config_dir(self, project_root: Path) -> Path:
+        from tasks.core import resolve_agent_dir
+        return resolve_agent_dir(project_root) / "pi"
 
     def install_hooks(self, project_root: Path) -> None:
-        return None
+        """Provision the per-project pi config under `<agent-dir>/pi/`.
+
+        Idempotent. Writes nothing under $HOME — the extension is loaded via the
+        wrapper's `-e` flag, so there is no global hook state to mutate. Honors
+        `.agent/current_user` (multi-user) via `resolve_agent_dir`.
+        """
+        import shutil
+        pi_dir = self._pi_config_dir(project_root)
+        config_dir = pi_dir / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (pi_dir / "sessions").mkdir(parents=True, exist_ok=True)
+        src = self._shipped_models_json()
+        if src is not None:
+            shutil.copyfile(src, config_dir / "models.json")
 
     def uninstall_hooks(self, project_root: Path) -> None:
-        return None
+        """Remove only the provisioned per-project pi config."""
+        import shutil
+        pi_dir = self._pi_config_dir(project_root)
+        if pi_dir.exists():
+            shutil.rmtree(pi_dir, ignore_errors=True)
 
     # ── Launch ───────────────────────────────────────────────────────────────
 
@@ -188,11 +246,19 @@ class PiAdapter(ProviderAdapter):
     def detect_capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
             provider="pi",
-            has_user_prompt_hook=False,
-            has_pre_tool_hook=False,
-            has_post_tool_hook=False,
+            # pi's extension system (`pi -e`) bridges to the bash hooks — see the
+            # Hooks section + T145. tool_call→PreToolUse (real `{block}` deny),
+            # tool_result→PostToolUse (gate echo), input→UserPromptSubmit.
+            has_user_prompt_hook=True,
+            has_pre_tool_hook=True,
+            has_post_tool_hook=True,
+            # No blocking Stop equivalent: pi can't refuse to end a turn, only
+            # soft-renudge via sendUserMessage. Anti-walk-away enforcement is
+            # deferred (Phase 2). Keep False so callers don't assume hard Stop.
             has_stop_hook=False,
-            session_id_in_payload=False,
+            # The wrapper sets PLAYBOOK_SESSION_ID and the adapter injects it into
+            # every hook payload (`sessionId()`), so session id IS in the payload.
+            session_id_in_payload=True,
             session_log_format="none",
             session_log_base=None,
         )

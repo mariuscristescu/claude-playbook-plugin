@@ -1,47 +1,113 @@
 #!/bin/bash
-# bin/playbook-pi — launch pi (via oMLX) with a per-session Playbook ID.
+# bin/playbook-pi — launch pi (driving a local oMLX model) as a Playbook
+# main agent with gate enforcement.
 #
-# Usage: playbook-pi [pi-args...]
+# Usage: playbook-pi [model] [pi-args...]
 #
-# Generates PLAYBOOK_SESSION_ID, provisions the session directory, then execs
-# `omlx launch pi` so pi inherits the env. oMLX writes ~/.pi/agent/models.json
-# and settings.json pointing at the local Qwen MLX server (127.0.0.1:8000/v1),
-# then os.execvpe's pi — the env propagates through.
+# What this does, vs the bare `pi` CLI:
+#   1. Discovers the Playbook project root (legacy `.agent/tasks` or
+#      multi-user `.agent/<user>/tasks`) and the resolved agent state dir.
+#   2. Enforces a model allow-list (local oMLX models only) — rejects anything
+#      else with exit 2, so a huge/unintended model can't be launched.
+#   3. Isolates pi's config under `<agent-dir>/pi/{config,sessions}` so a pi
+#      session never picks up unrelated global/project pi settings.
+#   4. Loads the Playbook hook adapter (`pi -e playbook-pi-hook-adapter.ts`),
+#      which bridges pi lifecycle events to the existing bash hooks
+#      (PreToolUse gate-block, post-tool gate echo, prompt logging).
+#
+# Hook scripts + the adapter live in the same dir as this wrapper once
+# installed (`$PLUGIN_DIR/scripts/`); in the dev repo they live in `scripts/`
+# while this wrapper is in `bin/`. We resolve HOOK_DIR by locating
+# `task-gate-hook` and export PLAYBOOK_HOOK_DIR so the adapter shells out to
+# the right scripts.
 #
 # Canonical user-facing entry point. See src/provider/adapters/pi.py
-# launch_interactive() for the programmatic equivalent (assumes env pre-set).
+# launch_interactive() for the programmatic equivalent.
 
-set -e
+set -euo pipefail
 
-# Find project root (directory containing .agent/tasks/)
-find_project_root() {
-    local dir="$PWD"
-    while [ "$dir" != "/" ]; do
-        if [ -d "$dir/.agent/tasks" ]; then
-            echo "$dir"
-            return 0
-        fi
-        dir="$(dirname "$dir")"
-    done
-    echo ""
-}
+# Models allowed for Playbook pi/oMLX (user-pinned, T144). NOT the huge
+# Qwen3-Coder-Next-4bit. Keep in sync with scripts/playbook-pi-omlx-models.json.
+ALLOWED_MODELS=(
+  "gemma-4-26b-a4b-it-4bit"
+  "Qwen3.6-35B-A3B-4bit"
+)
+DEFAULT_MODEL="Qwen3.6-35B-A3B-4bit"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# Resolve HOOK_DIR (dir containing the bash hooks + the adapter). Installed:
+# same dir as this wrapper. Dev: sibling ../scripts.
+if [ -f "$SCRIPT_DIR/task-gate-hook" ]; then
+  HOOK_DIR="$SCRIPT_DIR"
+elif [ -f "$SCRIPT_DIR/../scripts/task-gate-hook" ]; then
+  HOOK_DIR="$(cd "$SCRIPT_DIR/../scripts" && pwd -P)"
+else
+  echo "Error: cannot locate Playbook hook scripts (task-gate-hook) near $SCRIPT_DIR" >&2
+  exit 1
+fi
+
+# Reuse the canonical bash root + agent-dir resolution.
+# shellcheck source=/dev/null
+source "$HOOK_DIR/gate-echo-lib.sh"
 
 PROJECT_ROOT="$(find_project_root)"
 
+# Optional leading positional model arg (anything not starting with '-').
+MODEL="${PLAYBOOK_PI_MODEL:-$DEFAULT_MODEL}"
+if [ "${1:-}" != "" ] && [ "${1:-}" != "--" ] && [[ "${1:-}" != -* ]]; then
+  MODEL="$1"
+  shift
+fi
+if [ "${1:-}" = "--" ]; then
+  shift
+fi
+
+allowed=false
+for candidate in "${ALLOWED_MODELS[@]}"; do
+  [ "$MODEL" = "$candidate" ] && allowed=true && break
+done
+if [ "$allowed" != "true" ]; then
+  {
+    echo "Error: model '$MODEL' is not allowed for Playbook pi/oMLX."
+    echo "Allowed models:"
+    printf '  - %s\n' "${ALLOWED_MODELS[@]}"
+  } >&2
+  exit 2
+fi
+
 SESSION_ID="pid-$$"
 export PLAYBOOK_SESSION_ID="$SESSION_ID"
-export PLAYBOOK_PROJECT_ROOT="$PROJECT_ROOT"
+export PLAYBOOK_PROVIDER="pi"
+export PLAYBOOK_HOOK_DIR="$HOOK_DIR"
+
+# oMLX server is driven directly (it is expected to be already serving on
+# 127.0.0.1:8000); no `omlx launch` needed. The local server requires an API
+# key. These keep pi pinned to the local endpoint with no telemetry.
+export OMLX_API_KEY="${OMLX_API_KEY:-oMLX!26}"
+export PI_OFFLINE="${PI_OFFLINE:-1}"
+export PI_TELEMETRY="${PI_TELEMETRY:-0}"
 
 if [ -n "$PROJECT_ROOT" ]; then
-    mkdir -p "$PROJECT_ROOT/.agent/sessions/$SESSION_ID"
+  export PLAYBOOK_PROJECT_ROOT="$PROJECT_ROOT"
+  AGENT_DIR="$(resolve_agent_dir "$PROJECT_ROOT")"
+  PI_CONFIG_DIR="$AGENT_DIR/pi/config"
+  PI_SESSION_DIR="$AGENT_DIR/pi/sessions"
+  mkdir -p "$PI_CONFIG_DIR" "$PI_SESSION_DIR" "$AGENT_DIR/sessions/$SESSION_ID"
+  cp "$HOOK_DIR/playbook-pi-omlx-models.json" "$PI_CONFIG_DIR/models.json"
+  export PI_CODING_AGENT_DIR="$PI_CONFIG_DIR"
+  export PI_CODING_AGENT_SESSION_DIR="$PI_SESSION_DIR"
 fi
 
-if command -v omlx >/dev/null 2>&1; then
-    exec omlx launch pi "$@"
-elif command -v pi >/dev/null 2>&1; then
-    exec pi "$@"
-else
-    echo "Error: neither omlx nor pi found on PATH" >&2
-    echo "Install: oMLX app (https://omlx.app/) or pi CLI" >&2
-    exit 1
+if ! command -v pi >/dev/null 2>&1; then
+  echo "Error: 'pi' not found on PATH" >&2
+  echo "Install: pi CLI (https://github.com/pi-os/pi)" >&2
+  exit 1
 fi
+
+exec pi \
+  -e "$HOOK_DIR/playbook-pi-hook-adapter.ts" \
+  --provider omlx \
+  --model "$MODEL" \
+  --models "omlx/gemma-4-26b-a4b-it-4bit,omlx/Qwen3.6-35B-A3B-4bit" \
+  "$@"

@@ -12,12 +12,30 @@ without per-provider if/elif branches in cli.py.
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from .capabilities import ProviderCapabilities, SessionFacts
 from .events import MessageEvent, ToolEvent, StopEvent
 from .policy import Decision
+
+
+@dataclass
+class Invocation:
+    """A provider-agnostic description of how to launch one headless agent run.
+
+    The CORE invocation only: prompt/model/context/stream. Caller-specific
+    concerns (judge tools/budget, web search, timeouts) are layered on top of
+    `argv` by the caller — they never live in the seam. Dialects diverge in
+    *where* the prompt and context go, which is why this carries both:
+
+      - argv:  the agent's command-line args (bypass flag injected by sandbox.run)
+      - stdin: text piped to the process, or None. codex reads its prompt from
+               stdin (argv ends in "-"); claude/agy/pi put it in argv.
+    """
+    argv: list[str]
+    stdin: Optional[str] = None
 
 
 class ProviderAdapter(ABC):
@@ -65,6 +83,31 @@ class ProviderAdapter(ABC):
         """
         import shutil
         return shutil.which(cls.binary_name()) is not None
+
+    @abstractmethod
+    def headless_argv(
+        self,
+        prompt: str,
+        model: Optional[str],
+        *,
+        context: str = "",
+        bare: bool = False,
+        stream: bool = False,
+    ) -> Invocation:
+        """Build the CORE headless invocation for this provider from a prompt.
+
+        The single seam every headless use-case shares (judge, panel, sandbox
+        CLI, streaming chat subagent). Owns the per-provider dialect:
+          - where the prompt goes (argv vs stdin)
+          - how context attaches (separate flag vs joined into prompt/stdin)
+          - model flag spelling and default
+          - streaming flags when stream=True (e.g. stream-json / --mode json)
+
+        `bare=True` drops context entirely (prompt is the whole mission).
+        Returns an Invocation(argv, stdin). Bypass/containment flags are added
+        by sandbox.run(); caller-specific extras (tools, budget, web search,
+        timeouts) are layered onto argv by the caller, NOT here.
+        """
 
     @abstractmethod
     def run_headless_judge(

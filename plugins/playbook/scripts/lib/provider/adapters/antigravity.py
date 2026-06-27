@@ -35,7 +35,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from ..adapter import ProviderAdapter
+from ..adapter import ProviderAdapter, Invocation
 from ..capabilities import ProviderCapabilities, SessionFacts
 from ..policy import Decision
 
@@ -68,6 +68,22 @@ class AntigravityAdapter(ProviderAdapter):
         # When upstream ships -m: return ["gemini-3.5-flash", "gemini-3.1-pro"].
         return [None]
 
+    def headless_argv(
+        self,
+        prompt: str,
+        model: Optional[str],
+        *,
+        context: str = "",
+        bare: bool = False,
+        stream: bool = False,
+    ) -> Invocation:
+        # agy v1.0.2 quirks: prompt via --print flag (not stdin); --print mode
+        # ignores cwd so --add-dir exposes the project tree; no model flag.
+        # Bypass flag (--dangerously-skip-permissions) prepended by sandbox.
+        full_prompt = prompt if (bare or not context) else f"{context}\n\n---\n\n{prompt}"
+        argv = ["--add-dir", str(self._project_root), "--print", full_prompt]
+        return Invocation(argv)
+
     def run_headless_judge(
         self,
         prompt: str,
@@ -80,17 +96,9 @@ class AntigravityAdapter(ProviderAdapter):
         import shutil
         if not shutil.which(self.binary_name()):
             return f"(error: {self.binary_name()} not found on PATH)"
-        full_prompt = f"{system_context}\n\n---\n\n{prompt}"
-        # agy v1.0.2 quirks:
-        #  - takes prompt via --print/-p flag (not stdin)
-        #  - --print mode ignores cwd; needs --add-dir to expose the project tree
-        #  - --print-timeout accepts Go-style duration strings (e.g. "300s")
-        # Bypass flag (--dangerously-skip-permissions) prepended by sandbox.
-        agent_args = [
-            "--add-dir", str(self._project_root),
-            "--print", full_prompt,
-            "--print-timeout", f"{timeout_secs}s",
-        ]
+        inv = self.headless_argv(prompt, model, context=system_context)
+        # Judge-only extra: --print-timeout (Go-style duration).
+        agent_args = inv.argv + ["--print-timeout", f"{timeout_secs}s"]
         env = os.environ.copy()
         env["PLAYBOOK_SESSION_ID"] = self._session_id or "judge"
         from provider import sandbox as _sandbox

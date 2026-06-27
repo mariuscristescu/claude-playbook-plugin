@@ -1001,15 +1001,15 @@ def main():
 
         # --provider: install provider-specific bootstrap file (additive)
         if provider:
-            _PROVIDER_MAP = {"codex": "CodexAdapter", "antigravity": "AntigravityAdapter"}
+            _PROVIDER_MAP = {"codex": "CodexAdapter", "antigravity": "AntigravityAdapter", "pi": "PiAdapter"}
             if provider not in _PROVIDER_MAP:
-                print(f"Error: unknown provider '{provider}'. Choose: codex, antigravity", file=sys.stderr)
+                print(f"Error: unknown provider '{provider}'. Choose: codex, antigravity, pi", file=sys.stderr)
                 sys.exit(1)
             import importlib
             adapter_cls_name = _PROVIDER_MAP[provider]
             mod = importlib.import_module(f"provider.adapters.{provider}")
             adapter_cls = getattr(mod, adapter_cls_name)
-            bootstrap_file = {"codex": "AGENTS.md", "antigravity": "GEMINI.md"}[provider]
+            bootstrap_file = {"codex": "AGENTS.md", "antigravity": "GEMINI.md", "pi": "AGENTS.md"}[provider]
             bs_path = target / bootstrap_file
             already_existed = bs_path.exists()
             adapter = adapter_cls("init", target)
@@ -1018,7 +1018,7 @@ def main():
             if install_provider_hooks:
                 adapter.install_hooks(target)
         elif install_provider_hooks:
-            print("Error: --hooks requires --provider codex or --provider antigravity", file=sys.stderr)
+            print("Error: --hooks requires --provider codex, antigravity, or pi", file=sys.stderr)
             sys.exit(1)
 
     elif cmd == "bootstrap":
@@ -2539,7 +2539,23 @@ def main():
             print(f"\n{fixable} node(s) can be auto-synced main→overflow. Run: tasks mindmap-sync --fix")
 
     elif cmd == "log":
+        # tasks log [N] [--width W]
+        # Compact one-line-per-message view of chat_log.md (no gate cruft).
+        # N: show only the last N messages (default: all).
+        # --width: crop each message body to W chars (default 500).
         import re
+        cmd_args = sys.argv[2:]
+        last_n = None
+        width = 500
+        i = 0
+        while i < len(cmd_args):
+            a = cmd_args[i]
+            if a == "--width" and i + 1 < len(cmd_args):
+                width = max(10, int(cmd_args[i + 1])); i += 2
+            elif a.isdigit():
+                last_n = int(a); i += 1
+            else:
+                i += 1
         project_path = find_project_root()
         chat_log = resolve_agent_dir(project_path) / "chat_log.md"
         if not chat_log.exists():
@@ -2547,6 +2563,7 @@ def main():
             sys.exit(1)
         text = chat_log.read_text(encoding="utf-8")
         blocks = text.split("\n---\n")
+        lines = []
         for block in blocks:
             m = re.match(
                 r'\*\*(\[M\d+\])\*\* \[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}):\d{2} UTC\] `(\w+)`\s*\n+(.*)',
@@ -2554,10 +2571,14 @@ def main():
             )
             if m:
                 mid, ts, role, body = m.groups()
-                body = body.strip().replace("\n", " ")
-                if len(body) > 500:
-                    body = body[:497] + "..."
-                print(f"{mid} {ts} {role:<6} {body}")
+                body = " ".join(body.split())
+                if len(body) > width:
+                    body = body[:width - 1] + "…"
+                lines.append(f"{mid} {ts} {role:<6} {body}")
+        if last_n is not None:
+            lines = lines[-last_n:]
+        for line in lines:
+            print(line)
 
     elif cmd == "prepare-merge":
         project_path = find_project_root()

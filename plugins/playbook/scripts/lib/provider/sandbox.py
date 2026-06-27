@@ -327,16 +327,25 @@ def build_seatbelt_profile(
     project_dir: Path | str,
     git_dir: Path | str | None,
     extra_rw: Iterable[str] | None = None,
+    *,
+    project_writable: bool = True,
 ) -> str:
     """Generate a macOS seatbelt profile: allow default, deny writes except
     project_dir, system temp/dev, per-agent home subpaths, and extra_rw paths.
     Then deny .git writes within the project.
+
+    project_writable=False is the contained "outdir" mode: the project/corpus
+    becomes read-only (its write exception is dropped), so the only writable
+    project-side location is whatever's passed via extra_rw (the workspace).
+    Home/system paths stay writable — the agent binary needs its config/caches.
     """
     project = str(Path(project_dir).resolve())
     home = str(Path.home())
     rw_paths = _normalize_rw(extra_rw)
 
-    require_nots: list[str] = [f'        (require-not (subpath "{project}"))']
+    require_nots: list[str] = []
+    if project_writable:
+        require_nots.append(f'        (require-not (subpath "{project}"))')
     for sys_path in _SYSTEM_RW_PATHS:
         require_nots.append(f'        (require-not (subpath "{sys_path}"))')
     # ~/.claude and ~/.claude.json* — regex covers both.
@@ -371,16 +380,23 @@ def build_bwrap_argv(
     git_dir: Path | str | None,
     target_argv: list[str],
     extra_rw: Iterable[str] | None = None,
+    *,
+    project_writable: bool = True,
 ) -> list[str]:
     """Generate the bwrap argv: read-only root, bind project + tmp + per-agent
     home subpaths read-write, bind git_dir read-only.
+
+    project_writable=False is the contained "outdir" mode: the project/corpus is
+    bound read-only; the only writable project-side location is extra_rw (the
+    workspace). Home subpaths stay writable for the agent's config/caches.
     """
     project = str(Path(project_dir).resolve())
     home = Path.home()
     rw_paths = _normalize_rw(extra_rw)
 
     argv = ["bwrap", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev"]
-    argv += ["--bind", project, project, "--bind", "/tmp", "/tmp"]
+    project_bind = "--bind" if project_writable else "--ro-bind"
+    argv += [project_bind, project, project, "--bind", "/tmp", "/tmp"]
 
     write_log_dir = home / ".local" / "share" / "playbook"
     write_log_dir.mkdir(parents=True, exist_ok=True)
@@ -492,6 +508,42 @@ def _warn_nested_once() -> None:
         )
 
 
+def _wrapped_argv(
+    agent: str,
+    agent_args: list[str],
+    project: Path,
+    extra_rw: Iterable[str] | None,
+    project_writable: bool,
+) -> list[str]:
+    """Compose bypass-flag injection + seatbelt/bwrap wrapping into the final
+    argv. Shared by run() (blocking) and popen() (streaming) so containment is
+    generated in exactly one place. If already inside a sandbox (ours OR a
+    foreign one we can't nest in), returns the inner argv with bypass flags only.
+    """
+    inner_argv = _compose_agent_argv(agent, agent_args)
+    if is_sandboxed():
+        return inner_argv
+    if platform.system() == "Darwin" and shutil.which("sandbox-exec"):
+        if _seatbelt_usable():
+            git_dir = _git_dir_of(project)
+            profile = build_seatbelt_profile(project, git_dir, extra_rw, project_writable=project_writable)
+            return ["sandbox-exec", "-p", profile, *inner_argv]
+        # Nested in a foreign sandbox (macOS forbids sandbox-exec nesting, rc 71).
+        _warn_nested_once()
+        return inner_argv
+    if shutil.which("bwrap"):
+        git_dir = _git_dir_of(project)
+        return build_bwrap_argv(project, git_dir, inner_argv, extra_rw, project_writable=project_writable)
+    # No sandbox primitive available — exec directly with bypass.
+    return inner_argv
+
+
+def _child_env(env: dict[str, str] | None) -> dict[str, str]:
+    child_env = dict(os.environ) if env is None else dict(env)
+    child_env["PLAYBOOK_SANDBOXED"] = "1"
+    return child_env
+
+
 def run(
     agent: str,
     agent_args: list[str],
@@ -500,6 +552,7 @@ def run(
     env: dict[str, str] | None = None,
     capture_output: bool = False,
     check: bool = False,
+    project_writable: bool = True,
     **kwargs,
 ) -> subprocess.CompletedProcess:
     """Run an agent under sandbox containment. Composes bypass-flag injection
@@ -508,31 +561,8 @@ def run(
     nest in), skips wrapping but still injects bypass flags.
     """
     project = Path(project_root).resolve()
-    child_env = dict(os.environ) if env is None else dict(env)
-    child_env["PLAYBOOK_SANDBOXED"] = "1"
-
-    inner_argv = _compose_agent_argv(agent, agent_args)
-
-    if is_sandboxed():
-        # Already inside our own outer sandbox — exec target directly.
-        wrapped = inner_argv
-    elif platform.system() == "Darwin" and shutil.which("sandbox-exec"):
-        if _seatbelt_usable():
-            git_dir = _git_dir_of(project)
-            profile = build_seatbelt_profile(project, git_dir, extra_rw)
-            wrapped = ["sandbox-exec", "-p", profile, *inner_argv]
-        else:
-            # Nested in a foreign sandbox (macOS forbids sandbox-exec nesting,
-            # rc 71). Run directly — the outer sandbox provides containment.
-            _warn_nested_once()
-            wrapped = inner_argv
-    elif shutil.which("bwrap"):
-        git_dir = _git_dir_of(project)
-        wrapped = build_bwrap_argv(project, git_dir, inner_argv, extra_rw)
-    else:
-        # No sandbox primitive available — exec directly with bypass.
-        # Callers wanting strict containment must check is_sandboxed() upstream.
-        wrapped = inner_argv
+    child_env = _child_env(env)
+    wrapped = _wrapped_argv(agent, agent_args, project, extra_rw, project_writable)
 
     return subprocess.run(
         wrapped,
@@ -540,6 +570,36 @@ def run(
         env=child_env,
         capture_output=capture_output,
         check=check,
+        **kwargs,
+    )
+
+
+def popen(
+    agent: str,
+    agent_args: list[str],
+    project_root: Path | str,
+    extra_rw: Iterable[str] | None = None,
+    env: dict[str, str] | None = None,
+    project_writable: bool = True,
+    **kwargs,
+) -> subprocess.Popen:
+    """Non-blocking variant of run() — returns a live Popen for streaming.
+
+    Same containment/argv composition as run() (via _wrapped_argv), but the
+    caller drives stdout incrementally (e.g. line-by-line stream-json → events
+    for a chat sidebar). Defaults stdout to PIPE and text mode so callers can
+    iterate `proc.stdout`; override via kwargs.
+    """
+    project = Path(project_root).resolve()
+    child_env = _child_env(env)
+    wrapped = _wrapped_argv(agent, agent_args, project, extra_rw, project_writable)
+
+    kwargs.setdefault("stdout", subprocess.PIPE)
+    kwargs.setdefault("text", True)
+    return subprocess.Popen(
+        wrapped,
+        cwd=str(project),
+        env=child_env,
         **kwargs,
     )
 
@@ -612,6 +672,13 @@ def _main(argv: list[str]) -> int:
                         help="Extra read-write path (repeatable)")
     parser.add_argument("--project-root", default=None,
                         help="Project root (default: cwd)")
+    parser.add_argument("--prompt", default=None,
+                        help="Run a headless prompt via the unified subagent runner "
+                             "(builds the agent's native invocation for you, instead of raw -- args)")
+    parser.add_argument("--bare", action="store_true",
+                        help="With --prompt: no context, the prompt is the whole mission")
+    parser.add_argument("--stream", action="store_true",
+                        help="With --prompt: stream output events live to stdout")
     parser.add_argument("agent_args", nargs=argparse.REMAINDER,
                         help="Args passed verbatim to the agent binary")
 
@@ -655,9 +722,30 @@ def _main(argv: list[str]) -> int:
             )
             return 2
         agent = inferred_agent
+        model_for_spec = canonical_model
         forwarded = _inject_model_args(agent, canonical_model, extras, forwarded)
     else:
         agent = args.agent or default_agent()
+        model_for_spec = None
+
+    # --prompt: route through the unified subagent runner (builds the agent's
+    # native invocation via headless_argv). Raw `--` passthrough still works
+    # when --prompt is absent.
+    if args.prompt is not None:
+        from . import subagent as _subagent
+        spec = _subagent.SubagentSpec(
+            agent=agent, model=model_for_spec, prompt=args.prompt, bare=args.bare,
+        )
+        if args.stream:
+            for ev in _subagent.stream_subagent(spec, project_root=project):
+                if ev.text:
+                    sys.stdout.write(ev.text)
+                    sys.stdout.flush()
+            sys.stdout.write("\n")
+            return 0
+        res = _subagent.run_subagent(spec, project_root=project)
+        print(res.text)
+        return res.returncode
 
     result = run(agent, forwarded, project, extra_rw=args.rw)
     return result.returncode

@@ -183,11 +183,12 @@ MSG_ID=$(get_next_id "$COUNTER_FILE")
 # Session ID (needed for PID tag in chat log and counter reset)
 SESSION_ID="$(resolve_session_id)"
 SESSION_DIR="$AGENT_DIR/sessions/$SESSION_ID"
+PROVIDER="${PLAYBOOK_PROVIDER:-claude}"
 
 # Append to local chat log with message ID and PID tag
 echo "---" >> "$LOCAL_LOG"
 echo "" >> "$LOCAL_LOG"
-echo "**[$MSG_ID]** [$TIMESTAMP] \`HOST\` (claude/$SESSION_ID)" >> "$LOCAL_LOG"
+echo "**[$MSG_ID]** [$TIMESTAMP] \`HOST\` ($PROVIDER/$SESSION_ID)" >> "$LOCAL_LOG"
 echo "" >> "$LOCAL_LOG"
 echo "$USER_MESSAGE" >> "$LOCAL_LOG"
 echo "" >> "$LOCAL_LOG"
