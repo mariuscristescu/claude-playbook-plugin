@@ -121,6 +121,17 @@ if [ -f "$PROJECT_DIR/.claude/bin/sandbox" ]; then
     CREATED+=(".claude/bin/sandbox")
 fi
 
+# Provider launchers: thin find-and-exec wrappers so each provider's gate-hooked
+# entry point is reachable as .claude/bin/playbook-<x> in any project (the plugin
+# scripts/ dir is not on PATH). Generated uniformly; running one whose CLI isn't
+# installed just errors at exec time.
+for provider_wrapper in playbook-codex playbook-agy playbook-pi; do
+    create_wrapper "$PROJECT_DIR" "$provider_wrapper"
+    if [ -f "$PROJECT_DIR/.claude/bin/$provider_wrapper" ]; then
+        CREATED+=(".claude/bin/$provider_wrapper")
+    fi
+done
+
 # --- (e) bash history logging ---
 # BEGIN:bash-log
 SHELL_NAME="$(basename "$SHELL" 2>/dev/null)"

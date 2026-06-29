@@ -1,4 +1,26 @@
 #!/bin/bash
-# tasks CLI — bundled with plugin, no PATH setup needed
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PYTHONPATH="$SCRIPT_DIR/lib" exec python3 -m tasks.cli "$@"
+# tasks CLI — ships with plugin; the project's auto-generated .claude/bin/tasks
+# wrapper finds and execs this. (Dev contributors use bin/tasks instead.)
+set -e
+
+# Playbook runtime is stdlib-only — any python3 ≥ 3.10 works.
+# See CLAUDE.md "Runtime invariant" and memory project-stdlib-only-runtime.
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null \
+    || { echo "Playbook needs python3 >= 3.10 (found: $(python3 --version 2>&1))" >&2; exit 1; }
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+
+# Resolve PYTHONPATH for both layouts:
+#   installed plugin: <plugin>/tasks/  → PYTHONPATH=<plugin>
+#   dev repo:         <root>/src/tasks/ → PYTHONPATH=<root>/src
+if [ -d "$PROJECT_ROOT/tasks" ]; then
+    PLAYBOOK_PYPATH="$PROJECT_ROOT"
+elif [ -d "$PROJECT_ROOT/src/tasks" ]; then
+    PLAYBOOK_PYPATH="$PROJECT_ROOT/src"
+else
+    echo "Error: tasks/ module not found at $PROJECT_ROOT (tried 'tasks/' and 'src/tasks/')" >&2
+    exit 1
+fi
+
+PYTHONPATH="${PLAYBOOK_PYPATH}${PYTHONPATH:+:${PYTHONPATH}}" exec python3 -m tasks.cli "$@"

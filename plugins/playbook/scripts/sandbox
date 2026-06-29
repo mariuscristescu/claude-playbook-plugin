@@ -1,179 +1,96 @@
 #!/bin/bash
-# bin/sandbox — launch claude with filesystem write containment
+# scripts/sandbox — launch a headless or interactive agent with write containment.
 #
-# Usage: bin/sandbox [--rw PATH]... [-- claude-args...]
+# Thin bash shim → delegates to src/provider/sandbox.py (single source of truth
+# for profile generation, agent dispatch, nesting guard, autodetect).
 #
-# Wraps `claude` in a seatbelt sandbox (macOS) or bubblewrap (Linux) that
-# confines writes to the project directory. Writes outside the project are
-# blocked at the kernel level. .git/ is read-only even within the project.
+# Usage:
+#   scripts/sandbox [--agent NAME] [--rw PATH]... [--no-hooks] [-- agent-args...]
+#   scripts/sandbox --list-agents
+#   scripts/sandbox --print-profile [--agent NAME]
 #
 # Options:
-#   --rw PATH   Add a read-write path (can be repeated)
-#   --no-hooks  Disable all plugin hooks (clean isolated run)
-#   --          Everything after this goes to claude as arguments
+#   --agent NAME     Agent to launch: claude|codex|agy|pi (default: autodetect)
+#   --rw PATH        Add a read-write path (repeatable)
+#   --no-hooks       claude-only: disable all plugin hooks (clean isolated run)
+#   --list-agents    Print capability matrix and exit
+#   --print-profile  Print generated seatbelt profile and exit
+#   --               Everything after this is forwarded to the agent binary
 #
 # Examples:
-#   bin/sandbox                           # default: project dir writable
-#   bin/sandbox --rw /tmp/data -- -p "do stuff"
-#   bin/sandbox --rw ~/datasets --rw /tmp/scratch
-#   bin/sandbox --no-hooks -- -p "analyze this codebase"
-#   bin/sandbox --no-hooks --rw /tmp/output -- -p "generate report"
-#
-# Same paths, same venv, same node_modules, same claude — no Docker.
-# Must be run from inside a git repository.
+#   scripts/sandbox                                       # interactive claude (default)
+#   scripts/sandbox --agent codex -- exec "say hi"
+#   scripts/sandbox --agent agy -- --print "hi" --add-dir .
+#   scripts/sandbox --rw /tmp/data -- -p "do stuff"
+#   scripts/sandbox --list-agents
 
 set -e
 
-# --- Parse arguments ---
-RW_PATHS=()
-CLAUDE_ARGS=()
+# Playbook runtime is stdlib-only — any python3 ≥ 3.10 works.
+# See CLAUDE.md "Runtime invariant" and memory project-stdlib-only-runtime.
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null \
+    || { echo "Playbook needs python3 >= 3.10 (found: $(python3 --version 2>&1))" >&2; exit 1; }
+
+# Find project root (where the provider/ module lives).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# scripts/sandbox lives at <root>/scripts; bin/sandbox is symlink to ../scripts/sandbox.
+# .claude/bin/sandbox lives at <root>/.claude/bin (when installed).
+case "$SCRIPT_DIR" in
+    */scripts) PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)" ;;
+    */bin)     PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)" ;;
+    */.claude/bin) PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)" ;;
+    *)         PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)" ;;
+esac
+
+# Claude-specific shim: translate --no-hooks into claude's --safe-mode.
+# The old `--settings <empty {}>` shim only overrode one settings layer and
+# could NOT suppress plugin-registered hooks (our hooks register via the plugin
+# manifest, not settings) — ~60% of nested PDF mind-map runs leaked parent
+# hooks (T136). --safe-mode (claude 2.1.169) disables CLAUDE.md + plugins +
+# skills + hooks + MCP at the source, and is OAuth-compatible (unlike --bare).
+# Probed on 2.1.170: suppresses the plugin hooks with OAuth intact (T137 C1).
 NO_HOOKS=false
+FWD=()
+in_after_ddash=false
 while [ $# -gt 0 ]; do
+    if [ "$in_after_ddash" = true ]; then
+        FWD+=("$1"); shift; continue
+    fi
     case "$1" in
-        --rw)
-            shift
-            if [ -z "$1" ]; then
-                echo "Error: --rw requires a path argument" >&2
-                exit 1
-            fi
-            # Resolve to absolute path
-            RW_PATHS+=("$(cd "$1" 2>/dev/null && pwd -P || echo "$1")")
-            shift
-            ;;
-        --no-hooks)
-            NO_HOOKS=true
-            shift
-            ;;
-        --)
-            shift
-            CLAUDE_ARGS=("$@")
-            break
-            ;;
-        *)
-            CLAUDE_ARGS+=("$1")
-            shift
-            ;;
+        --no-hooks) NO_HOOKS=true; shift ;;
+        --)         FWD+=("$1"); in_after_ddash=true; shift ;;
+        *)          FWD+=("$1"); shift ;;
     esac
 done
 
-# --- No-hooks: create empty settings file ---
-SETTINGS_ARGS=()
 if [ "$NO_HOOKS" = true ]; then
-    NOHOOKS_FILE="/tmp/playbook-no-hooks-$$.json"
-    echo '{}' > "$NOHOOKS_FILE"
-    SETTINGS_ARGS=(--settings "$NOHOOKS_FILE")
+    # Inject --safe-mode AFTER the -- separator (claude top-level flag); if no
+    # separator was given, append one and the flag at the end.
+    new_fwd=()
+    injected=false
+    for arg in "${FWD[@]}"; do
+        new_fwd+=("$arg")
+        if [ "$arg" = "--" ] && [ "$injected" = false ]; then
+            new_fwd+=(--safe-mode)
+            injected=true
+        fi
+    done
+    if [ "$injected" = false ]; then
+        new_fwd+=(-- --safe-mode)
+    fi
+    FWD=("${new_fwd[@]}")
 fi
 
-# --- Find project root and .git directory (absolute paths) ---
-GIT_DIR="$(git rev-parse --git-dir 2>/dev/null)" || {
-    echo "Error: not inside a git repository" >&2
+# Resolve PYTHONPATH for both layouts:
+#   installed plugin: <plugin>/provider/  → PYTHONPATH=<plugin>
+#   dev repo:         <root>/src/provider/ → PYTHONPATH=<root>/src
+if [ -d "$PROJECT_ROOT/provider" ]; then
+    PLAYBOOK_PYPATH="$PROJECT_ROOT"
+elif [ -d "$PROJECT_ROOT/src/provider" ]; then
+    PLAYBOOK_PYPATH="$PROJECT_ROOT/src"
+else
+    echo "Error: provider/ module not found at $PROJECT_ROOT (tried 'provider/' and 'src/provider/')" >&2
     exit 1
-}
-GIT_DIR="$(cd "$GIT_DIR" && pwd -P)"
-PROJECT_DIR="$(pwd -P)"
-HOME_DIR="$HOME"
+fi
 
-# --- OS detection ---
-case "$(uname -s)" in
-    Darwin)
-        if ! command -v sandbox-exec &>/dev/null; then
-            echo "Error: sandbox-exec not found (required on macOS)" >&2
-            exit 1
-        fi
-
-        # Write containment: deny writes everywhere except project dir + claude paths
-        # Then deny .git writes even within project dir
-        # Note: macOS resolves /var → /private/var, so use /private/var/folders
-        # Note: ~/.claude.json* lives at $HOME root, use regex to match both .claude/ and .claude.json*
-        # Build --rw exceptions for seatbelt profile
-        RW_EXCEPTIONS=""
-        for rw in "${RW_PATHS[@]}"; do
-            RW_EXCEPTIONS="${RW_EXCEPTIONS}
-        (require-not (subpath \"$rw\"))"
-        done
-
-        PROFILE="(version 1)
-(allow default)
-(deny file-write*
-    (require-all
-        (require-not (subpath \"$PROJECT_DIR\"))
-        (require-not (subpath \"/tmp\"))
-        (require-not (subpath \"/private/tmp\"))
-        (require-not (subpath \"/var/folders\"))
-        (require-not (subpath \"/private/var/folders\"))
-        (require-not (regex #\"^$HOME_DIR/\\.claude\"))
-        (require-not (subpath \"$HOME_DIR/.codex\"))
-        (require-not (subpath \"$HOME_DIR/.gemini\"))
-        (require-not (subpath \"$HOME_DIR/.cache\"))
-        (require-not (subpath \"$HOME_DIR/.local\"))
-        (require-not (subpath \"$HOME_DIR/Library\"))
-        (require-not (subpath \"/dev\"))${RW_EXCEPTIONS}
-    )
-)
-(deny file-write* (subpath \"$GIT_DIR\"))"
-
-        echo "Launching claude with write containment (seatbelt)"
-        echo "  project: $PROJECT_DIR (read-write)"
-        echo "  .git:    $GIT_DIR (read-only)"
-        for rw in "${RW_PATHS[@]}"; do
-            echo "  rw:      $rw"
-        done
-        [ "$NO_HOOKS" = true ] && echo "  hooks:   disabled"
-        echo "  outside: blocked"
-        echo ""
-        # Redirect tool caches to /tmp — Claude Code's inner sandbox blocks ~/.cache
-        export UV_CACHE_DIR="/tmp/uv-cache"
-        # --no-hooks overrides sandbox-hooks.json; default uses project's sandbox hooks
-        if [ ${#SETTINGS_ARGS[@]} -eq 0 ] && [ -f ".claude/sandbox-hooks.json" ]; then
-            SETTINGS_ARGS=(--settings .claude/sandbox-hooks.json)
-        fi
-        exec sandbox-exec -p "$PROFILE" claude \
-            --dangerously-skip-permissions \
-            "${SETTINGS_ARGS[@]}" \
-            "${CLAUDE_ARGS[@]}"
-        ;;
-
-    Linux)
-        if command -v bwrap &>/dev/null; then
-            WRITE_LOG_DIR="$HOME_DIR/.local/share/playbook"
-            mkdir -p "$WRITE_LOG_DIR"
-            # Build bwrap command with --rw paths
-            # Start with root read-only (deny-write by default, matching macOS seatbelt semantics)
-            # then explicitly bind writable paths
-            BWRAP_CMD=(bwrap
-                --ro-bind / /
-                --proc /proc
-                --dev /dev
-                --bind "$PROJECT_DIR" "$PROJECT_DIR"
-                --bind /tmp /tmp
-                --ro-bind "$GIT_DIR" "$GIT_DIR"
-                --bind "$WRITE_LOG_DIR" "$WRITE_LOG_DIR"
-            )
-            for rw in "${RW_PATHS[@]}"; do
-                mkdir -p "$rw"
-                BWRAP_CMD+=(--bind "$rw" "$rw")
-            done
-            BWRAP_CMD+=(claude --dangerously-skip-permissions "${SETTINGS_ARGS[@]}" "${CLAUDE_ARGS[@]}")
-            echo "Launching claude with write containment (bubblewrap)"
-            echo "  project: $PROJECT_DIR (read-write)"
-            echo "  .git:    $GIT_DIR (read-only)"
-            for rw in "${RW_PATHS[@]}"; do
-                echo "  rw:      $rw"
-            done
-            [ "$NO_HOOKS" = true ] && echo "  hooks:   disabled"
-            echo "  outside: read-only"
-            echo ""
-            exec "${BWRAP_CMD[@]}"
-        else
-            echo "Error: bubblewrap (bwrap) not found" >&2
-            echo "Install: apt install bubblewrap" >&2
-            exit 1
-        fi
-        ;;
-
-    *)
-        echo "Error: unsupported OS: $(uname -s)" >&2
-        echo "Supported: macOS (seatbelt), Linux (bubblewrap)" >&2
-        exit 1
-        ;;
-esac
+PYTHONPATH="${PLAYBOOK_PYPATH}${PYTHONPATH:+:${PYTHONPATH}}" exec python3 -m provider.sandbox "${FWD[@]}"
