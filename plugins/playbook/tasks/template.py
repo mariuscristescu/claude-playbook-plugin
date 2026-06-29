@@ -419,7 +419,7 @@ Then **ask the user** what they want to work on. Don't autonomously pick a task.
 
 ```bash
 .claude/bin/tasks work <number>              # activate task, hook starts tracking
-.claude/bin/tasks work done                  # deactivate when finished
+.claude/bin/tasks work done [--force]        # finish; bounces if gates still open (--force overrides)
 .claude/bin/tasks new <type> <name> [intent] # create task — intent fills ## Intent
 .claude/bin/tasks new --stub <type> <name> [intent] # stub — expands on tasks work
 .claude/bin/tasks plan-review <number>       # blind plan review by independent agent
@@ -620,7 +620,7 @@ Usage: tasks <command> [args]
 
 Commands:
   work <number>       Set active task (e.g. tasks work 058)
-  work done           Deactivate current task
+  work done [--force] Finish task; bounces if gates still open (--force overrides)
   freehand            User-driven mode (no gate pressure)
   new <type> <name> [intent]   Create task (intent pre-fills ## Intent)
   new --stub <type> <name> [intent]   Create stub (expands on work)

@@ -632,6 +632,34 @@ def print_usage():
     print(usage_text())
 
 
+def _gate_bounce(task_id: str, task_file, action: str) -> bool:
+    """If `task_file` has open (unchecked) gates, print a steering message and
+    return True (the caller should abort). Returns False when all gates are
+    checked. The `--force` decision is the caller's — this only reports.
+    """
+    from tasks.core import _extract_head_position
+    head = _extract_head_position(task_file)
+    if head == "(all gates checked)":
+        return False
+    try:
+        open_count = sum(
+            1 for ln in task_file.read_text(encoding="utf-8").splitlines()
+            if ln.strip().startswith("- [ ]")
+        )
+    except OSError:
+        open_count = 0
+    print(
+        f"Blocked: task {task_id} has {open_count} open gate(s) — {action} needs them finalized.",
+        file=sys.stderr,
+    )
+    print(f"  Next open gate: {head}", file=sys.stderr)
+    print(
+        "  Finish them (check the boxes in task.md), then retry — or override with --force.",
+        file=sys.stderr,
+    )
+    return True
+
+
 def main():
     # Force utf-8 on Windows where the default console encoding (cp1252) chokes on → and emoji.
     if hasattr(sys.stdout, "reconfigure"):
@@ -659,6 +687,7 @@ def main():
         task_num = cmd_args[0]
         if task_num != "done" and task_num.isdigit():
             task_num = task_num.zfill(3)
+        force = any(a in ("--force", "-f") for a in cmd_args[1:])
         project_path = find_project_root()
 
         # Handle 'tasks work done' - deactivate current task and set Status in task.md
@@ -676,6 +705,8 @@ def main():
                 matches = list(tasks_dir.glob(f"{prev_task}-*/task.md"))
                 if matches:
                     task_file = matches[0]
+                    if not force and _gate_bounce(prev_task, task_file, "closing this task"):
+                        sys.exit(1)
                     lines = task_file.read_text(encoding="utf-8").splitlines(keepends=True)
                     for i, line in enumerate(lines):
                         if line.strip() == "## Status" and i + 1 < len(lines):
@@ -747,15 +778,22 @@ def main():
                 prev_file = prev_matches[0]
                 prev_status = _extract_status(prev_file)
                 prev_head = _extract_head_position(prev_file)
-                if prev_head == "(all gates checked)" and not prev_status.startswith("done"):
-                    # Auto-close: set status to done
-                    prev_lines = prev_file.read_text(encoding="utf-8").splitlines(keepends=True)
-                    for i, line in enumerate(prev_lines):
-                        if line.strip() == "## Status" and i + 1 < len(prev_lines):
-                            prev_lines[i + 1] = "done\n"
-                            prev_file.write_text("".join(prev_lines), encoding="utf-8")
-                            break
-                    print(f"Auto-closed task {prev_task} (all gates checked).")
+                if prev_head == "(all gates checked)":
+                    if not prev_status.startswith("done"):
+                        # Auto-close: set status to done
+                        prev_lines = prev_file.read_text(encoding="utf-8").splitlines(keepends=True)
+                        for i, line in enumerate(prev_lines):
+                            if line.strip() == "## Status" and i + 1 < len(prev_lines):
+                                prev_lines[i + 1] = "done\n"
+                                prev_file.write_text("".join(prev_lines), encoding="utf-8")
+                                break
+                        print(f"Auto-closed task {prev_task} (all gates checked).")
+                elif not prev_status.startswith("done") and not force:
+                    # prev task still has open gates — don't silently abandon it.
+                    _gate_bounce(prev_task, prev_file, f"switching to task {task_num}")
+                    sys.exit(1)
+                elif not prev_status.startswith("done"):
+                    print(f"--force: switching away from task {prev_task} with open gates (left in_progress).")
 
         # Write task number to per-session current_state
         session_dir.mkdir(parents=True, exist_ok=True)
