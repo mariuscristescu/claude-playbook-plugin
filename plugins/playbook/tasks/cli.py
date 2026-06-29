@@ -6,7 +6,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from tasks.core import create_task, list_tasks, task_status, PLAYBOOKS, _find_playbook_skill, resolve_session_id, resolve_agent_dir
+from tasks.core import create_task, list_tasks, task_status, PLAYBOOKS, _find_playbook_skill, resolve_session_id, resolve_agent_dir, run_merge_doctor
 
 
 def _state_file(project_path: Path) -> Path:
@@ -2482,6 +2482,43 @@ def main():
         else:
             print()
 
+    elif cmd == "merge-doctor":
+        if cmd_args and cmd_args[0] in ("--help", "-h"):
+            print("Usage: tasks merge-doctor <source-branch> [target-branch]")
+            print()
+            print("  Audits a cross-namespace merge for per-user contamination,")
+            print("  stranded conflict markers, and legacy .agent/ paths.")
+            print("  Inspects the in-progress merge (MERGE_HEAD present) or the most")
+            print("  recent merge commit reachable from HEAD. <source>/<target> are")
+            print("  used for cross-comparison only — no branch is checked out.")
+            print()
+            print("  Exit: 1 if any actionable findings, else 0.")
+            sys.exit(0)
+        if not cmd_args:
+            print("Usage: tasks merge-doctor <source-branch> [target-branch]", file=sys.stderr)
+            print("  Audits a cross-namespace merge for per-user contamination,", file=sys.stderr)
+            print("  stranded conflict markers, and legacy .agent/ paths.", file=sys.stderr)
+            print("  Run 'tasks merge-doctor --help' for details.", file=sys.stderr)
+            sys.exit(2)
+        source = cmd_args[0]
+        target = cmd_args[1] if len(cmd_args) > 1 else "main"
+        project_path = find_project_root()
+        if not (project_path / ".git").exists():
+            print(f"Error: not a git repository: {project_path}", file=sys.stderr)
+            sys.exit(2)
+        # Validate both refs up front. A bad ref otherwise collapses to an empty
+        # user set in _md_user_dirs and the doctor can exit 0 ("SAFE") while
+        # silently skipping the intended cross-branch comparison.
+        import subprocess as _sp
+        for _ref in (source, target):
+            if _sp.run(["git", "rev-parse", "--verify", "--quiet", f"{_ref}^{{commit}}"],
+                       cwd=str(project_path), capture_output=True).returncode != 0:
+                print(f"Error: not a valid git ref: {_ref}", file=sys.stderr)
+                print("Usage: tasks merge-doctor <source-branch> [target-branch]", file=sys.stderr)
+                sys.exit(2)
+        findings = run_merge_doctor(project_path, source, target)
+        sys.exit(1 if findings else 0)
+
     elif cmd == "mindmap-sync":
         import re as _re
         project_path = find_project_root()
@@ -2498,14 +2535,33 @@ def main():
         fix_mode = "--fix" in cmd_args
 
         def _extract_nodes(filepath: Path) -> dict[int, str]:
-            """Extract {node_id: full_text} from a mind map file."""
+            """Extract {node_id: full_text} from a mind map file.
+
+            Splitting on the `^[N]` lookahead makes the LAST node absorb
+            everything to EOF — so a trailing `## Legacy`/notes section would be
+            folded into that node's text and show up as phantom drift. Guard
+            against that by cutting a node's text at the first markdown heading
+            (`#…`) after its first line — but NOT a `#` line inside a fenced code
+            block (a `# comment` in a code example), so multi-line overflow node
+            bodies with code aren't truncated.
+            """
             content = filepath.read_text(encoding="utf-8")
             nodes: dict[int, str] = {}
             parts = _re.split(r'(?m)^(?=\[\d+\])', content)
             for part in parts:
                 m = _re.match(r'^\[(\d+)\]', part)
                 if m:
-                    nodes[int(m.group(1))] = part.strip()
+                    lines = part.split('\n')
+                    end = len(lines)
+                    in_fence = False
+                    for i in range(1, len(lines)):
+                        if lines[i].lstrip().startswith('```'):
+                            in_fence = not in_fence
+                            continue
+                        if not in_fence and _re.match(r'^#{1,6}\s', lines[i]):
+                            end = i
+                            break
+                    nodes[int(m.group(1))] = '\n'.join(lines[:end]).strip()
             return nodes
 
         main_nodes = _extract_nodes(main_file)
@@ -2529,25 +2585,32 @@ def main():
         if overflow_only:
             print(f"Missing from main: {overflow_only}")
 
-        # Content drift (full nodes only — summary nodes are intentionally shorter)
-        drifted_main_ahead: list[tuple[int, int]] = []
-        drifted_overflow_ahead: list[tuple[int, int]] = []
+        # Content drift (full nodes only — summary nodes are intentionally shorter).
+        # `drifted` = EVERY full node whose main/overflow text differs, regardless
+        # of length sign. A same-length ref remap (e.g. [29]→[36]) has diff==0 and
+        # used to be mis-bucketed as "overflow ahead" and skipped by --fix; it now
+        # lands in `drifted` and is auto-syncable. main is the canonical source, so
+        # all drift syncs main→overflow.
+        # NOTE: the `'↗' not in main_text` gate means SUMMARY (↗) nodes never enter
+        # this comparison — so mindmap-sync structurally CANNOT catch a stale ref
+        # buried in the OVERFLOW body of a ↗-summary node (the §4.3 case). That is
+        # ref-integrity.py's job (whole-file ref scan) + the skill's manual grep.
+        drifted: list[tuple[int, int]] = []   # (nid, signed diff = len(main)-len(overflow))
         for nid in sorted(set(main_nodes) & set(overflow_nodes)):
             main_text = main_nodes[nid]
             overflow_text = overflow_nodes[nid]
             if '↗' not in main_text and main_text != overflow_text:
-                diff = len(main_text) - len(overflow_text)
-                if diff > 0:
-                    drifted_main_ahead.append((nid, diff))
-                else:
-                    drifted_overflow_ahead.append((nid, -diff))
+                drifted.append((nid, len(main_text) - len(overflow_text)))
 
-        if drifted_main_ahead or drifted_overflow_ahead:
+        if drifted:
             print("Content drift (full nodes only):")
-            for nid, diff in drifted_main_ahead:
-                print(f"  [{nid}] main AHEAD by {diff} chars")
-            for nid, diff in drifted_overflow_ahead:
-                print(f"  [{nid}] overflow AHEAD by {diff} chars")
+            for nid, diff in drifted:
+                if diff > 0:
+                    print(f"  [{nid}] main AHEAD by {diff} chars")
+                elif diff < 0:
+                    print(f"  [{nid}] overflow AHEAD by {-diff} chars")
+                else:
+                    print(f"  [{nid}] differs (same length — e.g. ref remap)")
         else:
             print("No content drift.")
 
@@ -2558,11 +2621,12 @@ def main():
         if broken:
             print(f"\nBroken cross-references: {broken}")
 
-        # --fix: copy main→overflow for nodes where main is ahead
-        if fix_mode and (drifted_main_ahead or main_only):
+        # --fix: copy main→overflow for EVERY drifted full node (any length sign,
+        # incl. same-length ref remaps) plus nodes missing from overflow.
+        if fix_mode and (drifted or main_only):
             overflow_content = overflow_file.read_text(encoding="utf-8")
             fixed = 0
-            for nid, _ in drifted_main_ahead:
+            for nid, _ in drifted:
                 old_text = overflow_nodes[nid]
                 new_text = main_nodes[nid]
                 overflow_content = overflow_content.replace(old_text, new_text)
@@ -2572,8 +2636,8 @@ def main():
                 fixed += 1
             overflow_file.write_text(overflow_content, encoding="utf-8")
             print(f"\nFixed: synced {fixed} node(s) main→overflow")
-        elif drifted_main_ahead or main_only:
-            fixable = len(drifted_main_ahead) + len(main_only)
+        elif drifted or main_only:
+            fixable = len(drifted) + len(main_only)
             print(f"\n{fixable} node(s) can be auto-synced main→overflow. Run: tasks mindmap-sync --fix")
 
     elif cmd == "log":

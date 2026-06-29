@@ -11,18 +11,20 @@
 
 set -euo pipefail
 
-# Resolve plugin scripts path relative to this file (portable across cwd).
+# Resolve plugin root relative to this file (portable across cwd).
+# Canonical install layout (T135): the `tasks` package lives directly under
+# plugins/playbook/, so PYTHONPATH points there (not the legacy scripts/lib).
 HERE="$(cd "$(dirname "$0")" && pwd)"
-PLUGIN_SCRIPTS="$HERE/../plugins/playbook/scripts"
+PLUGIN_ROOT="$HERE/../plugins/playbook"
 
 # Function-form CLI dispatch — handles paths containing spaces correctly,
 # unlike a TASKS="env PYTHONPATH=... python3 ..." string that bash would
 # word-split on unquoted expansion.
 tasks_cli() {
-    PYTHONPATH="$PLUGIN_SCRIPTS/lib" python3 -m tasks.cli "$@"
+    PYTHONPATH="$PLUGIN_ROOT" python3 -m tasks.cli "$@"
 }
 export -f tasks_cli 2>/dev/null || true
-export PLUGIN_SCRIPTS
+export PLUGIN_ROOT
 
 PASS=0
 FAIL=0
@@ -448,6 +450,116 @@ assert_in_section "$OUT" "ACTIONABLE" ".agent/current_user" "S7 .agent/current_u
 assert_in_section "$OUT" "ACTIONABLE" "git rm --cached" "S7 actionable includes git rm --cached hint"
 
 cd / && rm -rf "$SCEN7"
+echo
+
+# ----- Scenario 8: non-UTF-8 (cp1252) files are scanned, not skipped/crashed -
+# Regression guard for B1: a Windows-cp1252 byte (0x92 = right single quote)
+# in (a) a COMMITTED per-user file → exercises the git-show decode path
+# (_md_git), and (b) a WORKING-TREE contaminated file → exercises the
+# rglob read path. Pre-fix: git show raised UnicodeDecodeError (crash) and
+# the working-tree read silently `continue`d (contamination missed). Post-fix
+# (errors="replace"): both decode safely and the contamination is still found.
+echo "Scenario 8: cp1252 files scanned not skipped/crashed (B1 regression)"
+SCEN8=$(mktemp -d -t merge-doctor-s8.XXXXXX)
+( build_two_user_repo "$SCEN8" "userA" "userB" )
+cd "$SCEN8"
+
+# (a) Put a cp1252 byte into userB's COMMITTED chat_log → git-show path.
+git checkout -q branch_userB
+printf '[userB cp1252 note \x92 end]\n' >> .agent/userB/chat_log.md
+git commit -aq -m "userB cp1252 note"
+git checkout -q branch_userA
+
+git merge --no-commit --no-ff branch_userB || true
+mkdir -p .agent/userA .agent/userB
+git show branch_userA:.agent/userA/chat_log.md > .agent/userA/chat_log.md
+git show branch_userB:.agent/userB/chat_log.md > .agent/userB/chat_log.md
+# Contaminate userA with a known userB line (detectable), then make userA's
+# working-tree file non-UTF-8 too → (b) working-tree read path.
+printf '[userB-only line: hello from userB]\n' >> .agent/userA/chat_log.md
+printf 'trailing cp1252 byte \x92 here\n' >> .agent/userA/chat_log.md
+
+set +e
+OUT="$(tasks_cli merge-doctor branch_userB branch_userA 2>&1)"
+RC=$?
+set -e
+
+assert_nonzero "$RC" "S8 exit non-zero (contamination still detected in cp1252 file)"
+assert_in_section "$OUT" "ACTIONABLE" "contamination: .agent/userA/chat_log.md" "S8 cp1252 working-tree file still scanned (not skipped)"
+if printf '%s' "$OUT" | grep -qiE "Traceback|UnicodeDecodeError"; then
+    fail "S8 merge-doctor crashed on non-UTF-8 input (decode fix regressed)"
+    echo "----- output start -----"; printf '%s\n' "$OUT"; echo "----- output end -----"
+else
+    pass "S8 no traceback on cp1252 (git-show + working-tree decode both safe)"
+fi
+
+cd / && rm -rf "$SCEN8"
+echo
+
+# ----- Scenario 9: an invalid ref is rejected, not silently "SAFE" -----------
+# Regression guard for impl-F3: a bogus source/target ref used to collapse to an
+# empty user set and let merge-doctor exit 0. It must now exit 2 with a clear error.
+echo "Scenario 9: invalid ref rejected with exit 2 (impl-F3 regression)"
+SCEN9=$(mktemp -d -t merge-doctor-s9.XXXXXX)
+mkdir -p "$SCEN9" && cd "$SCEN9"
+git init -q -b main
+git config user.email "fixture@example"; git config user.name "fixture"
+printf 'x\n' > f.txt; git add .; git commit -q -m initial
+set +e
+OUT="$(tasks_cli merge-doctor does-not-exist main 2>&1)"; RC=$?
+set -e
+if [ "$RC" -eq 2 ]; then pass "S9 invalid ref → exit 2 (RC=$RC)"; else fail "S9 expected exit 2, got $RC"; fi
+assert_contains "$OUT" "not a valid git ref" "S9 names the invalid ref"
+cd / && rm -rf "$SCEN9"
+echo
+
+# ----- Scenario 10: PRE-EXISTING doc markers + markdown ======= --------------
+# Regression guard (codex impl-F4): a doc with literal conflict-marker EXAMPLES
+# that pre-exist in the parents — and which the merge merely appends to — must
+# NOT be actionable (the markers aren't NEW vs a parent). A markdown setext
+# `=======` underline must not be flagged at all. Real NEW markers (S6b) fire.
+echo "Scenario 10: pre-existing doc markers not flagged as stranded (task-004 W4)"
+SCEN10=$(mktemp -d -t merge-doctor-s10.XXXXXX)
+mkdir -p "$SCEN10" && cd "$SCEN10"
+git init -q -b main; git config user.email "fixture@example"; git config user.name "fixture"
+printf 'Example conflict:\n<<<<<<< HEAD\nfoo\n=======\nbar\n>>>>>>> branch\n' > doc.md  # markers from the START
+printf 'Section Title\n=======\nbody text here\n' > setext.md                          # markdown H1 underline
+printf 'x\n' > a.txt; git add .; git commit -q -m base
+git checkout -q -b f; printf 'appended on f\n' >> doc.md; git add .; git commit -q -m feat   # merge will TOUCH doc.md
+git checkout -q main; printf 'y\n' > c.txt; git add .; git commit -q -m mainwork
+git merge -q --no-ff -m merge f                                                          # doc.md touched, markers pre-existing
+set +e
+OUT="$(tasks_cli merge-doctor f main 2>&1)"; RC=$?
+set -e
+assert_zero "$RC" "S10 exit 0 (pre-existing doc markers are not actionable)"
+if printf '%s' "$OUT" | grep -q "stranded conflict markers in doc.md"; then fail "S10 doc.md wrongly actionable"; else pass "S10 merge-touched doc with pre-existing markers not actionable"; fi
+if printf '%s' "$OUT" | grep -q "setext.md"; then fail "S10 markdown ======= wrongly flagged"; else pass "S10 markdown ======= line not flagged"; fi
+assert_in_section "$OUT" "INFORMATIONAL" "doc.md" "S10 doc.md surfaced as informational"
+cd / && rm -rf "$SCEN10"
+echo
+
+# ----- Scenario 11: untracked file is not contamination ----------------------
+# Regression guard for the field FP: an UNTRACKED per-user file can't enter the
+# commit, so shared lines with another user are not contamination.
+echo "Scenario 11: untracked file not flagged as contamination (task-004 W4)"
+SCEN11=$(mktemp -d -t merge-doctor-s11.XXXXXX)
+mkdir -p "$SCEN11" && cd "$SCEN11"
+git init -q -b main; git config user.email "fixture@example"; git config user.name "fixture"
+mkdir -p .agent/userA .agent/userB
+printf 'taskA\n' > .agent/userA/task.md                                  # makes userA a tracked namespace
+printf 'boilerplate alpha line here\nboilerplate beta line here\n' > .agent/userB/chat_log.md
+printf '# MIND_MAP\n' > MIND_MAP.md
+git add .; git commit -q -m base
+git checkout -q -b f; printf 'z\n' > c.txt; git add .; git commit -q -m feat
+git checkout -q main; git merge -q --no-ff -m merge f
+# userA's chat_log is UNTRACKED but carries userB's lines (no committed userA copy → self_lines empty):
+printf 'boilerplate alpha line here\nboilerplate beta line here\n' > .agent/userA/chat_log.md   # NOT git add'd
+set +e
+OUT="$(tasks_cli merge-doctor f main 2>&1)"; RC=$?
+set -e
+assert_zero "$RC" "S11 exit 0 (untracked file is not contamination)"
+if printf '%s' "$OUT" | grep -q "contamination: .agent/userA/chat_log.md"; then fail "S11 untracked file wrongly flagged as contamination"; else pass "S11 untracked chat_log not flagged"; fi
+cd / && rm -rf "$SCEN11"
 echo
 
 # ----- Summary --------------------------------------------------------------
