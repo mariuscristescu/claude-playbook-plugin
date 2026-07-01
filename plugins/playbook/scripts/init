@@ -48,14 +48,24 @@ else
     SKIPPED+=(".agent/playbooks/ (exists)")
 fi
 
+# On Git-Bash/MSYS, python3 is usually native Windows Python, which cannot open
+# MSYS-style paths (/c/Users/...). Convert to a mixed-mode Windows path
+# (C:/Users/...) — forward slashes so it's also safe inside a Python string
+# literal — before handing a path to python3. No-op on real POSIX, where
+# cygpath is absent and the original path is echoed unchanged.
+to_native_path() {
+    cygpath -m "$1" 2>/dev/null || echo "$1"
+}
+
 # --- (b) settings.json permissions.deny merge ---
 SETTINGS_FILE="$PROJECT_DIR/.claude/settings.json"
 mkdir -p "$PROJECT_DIR/.claude"
+SETTINGS_FILE_PY="$(to_native_path "$SETTINGS_FILE")"
 
 SETTINGS_RESULT=$(python3 -c "
 import json, sys, os
 
-path = '$SETTINGS_FILE'
+path = '$SETTINGS_FILE_PY'
 required = ['TodoWrite', 'Task', 'EnterPlanMode']
 
 try:
@@ -180,11 +190,14 @@ if [ -f "$BASH_LOG_SRC" ]; then
     # Inject BASH_ENV into ~/.claude/settings.json so CC passes it to every bash shell it spawns.
     # This is the reliable path — CC reads settings.json env key and injects vars before tool calls.
     CC_SETTINGS="$HOME/.claude/settings.json"
+    CC_SETTINGS_PY="$(to_native_path "$CC_SETTINGS")"
     BASH_ENV_RESULT=$(python3 -c "
 import json, os, tempfile
-path = '$CC_SETTINGS'
-# Always bash-log.sh — CC's Bash tool is /bin/bash regardless of user's login shell
-dest = os.path.expanduser('~/.claude/bash-log.sh')
+path = '$CC_SETTINGS_PY'
+# Always bash-log.sh — CC's Bash tool is /bin/bash regardless of user's login shell.
+# Forward-slash the path: on Windows expanduser yields backslashes, but BASH_ENV
+# is read by Git-Bash which needs a POSIX-sourceable path (C:/Users/... works).
+dest = os.path.expanduser('~/.claude/bash-log.sh').replace(os.sep, '/')
 try:
     data = json.loads(open(path).read()) if os.path.exists(path) else {}
     env = data.setdefault('env', {})
@@ -278,7 +291,7 @@ if [ -n "$MONITOR_LIB_DIR" ] && [ -d "$MONITOR_LIB_DIR" ]; then
     NUDGE_HOOK_CMD='bash "$CLAUDE_PROJECT_DIR/.claude/hooks/monitor-nudge.sh"'
     HOOK_RESULT=$(python3 -c "
 import json, os
-path = '$SETTINGS_FILE'
+path = '$SETTINGS_FILE_PY'
 target_cmd = '''$NUDGE_HOOK_CMD'''
 try:
     data = json.loads(open(path).read()) if os.path.exists(path) else {}

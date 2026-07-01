@@ -102,11 +102,14 @@ class AntigravityAdapter(ProviderAdapter):
         env = os.environ.copy()
         env["PLAYBOOK_SESSION_ID"] = self._session_id or "judge"
         from provider import sandbox as _sandbox
+        # agy takes its prompt via the `--print <prompt>` flag (not stdin, per
+        # the headless_argv note), so context stays on argv; encoding="utf-8"
+        # guards the stdout decode against the Windows cp1252 locale default.
         result = _sandbox.run(
             "agy", agent_args,
             project_root=self._project_root,
             env=env,
-            capture_output=True, text=True, timeout=timeout_secs + 30,
+            capture_output=True, text=True, timeout=timeout_secs + 30, encoding="utf-8",
         )
         return _sandbox.format_judge_output(result)
 

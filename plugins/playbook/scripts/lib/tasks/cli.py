@@ -36,7 +36,7 @@ def _capture_recent_chat(project_path: Path, max_messages: int = 10,
     if not chat_log.exists():
         return []
 
-    content = chat_log.read_text(encoding="utf-8")
+    content = chat_log.read_text(encoding="utf-8", errors="replace")
     # Split into message blocks on --- separator
     msg_pattern = re.compile(
         r'\*\*\[(M\d+)\]\*\*\s+\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC\]\s+`\w+`\s*\n\s*\n(.*?)(?=\n---|\Z)',
@@ -475,7 +475,7 @@ def _rewrite_task_refs(project_path: Path, agent_dir: Path, rename_map: dict[int
     # Rewrite chat_log.md
     chat_log = agent_dir / "chat_log.md"
     if chat_log.exists():
-        original = chat_log.read_text(encoding="utf-8")
+        original = chat_log.read_text(encoding="utf-8", errors="replace")
         updated = _apply(original)
         if updated != original:
             chat_log.write_text(updated, encoding="utf-8")
@@ -526,7 +526,7 @@ def _prepare_merge_chatlog(project_path: Path, agent_dir: Path, target: str,
         print("Chat log: not found — skipping.")
         return
 
-    current_text = chat_log.read_text(encoding="utf-8")
+    current_text = chat_log.read_text(encoding="utf-8", errors="replace")
     new_mids = [int(m) for m in re.findall(r"\*\*\[M(\d+)\]\*\*", current_text) if int(m) > base_last]
 
     if not new_mids:
@@ -1178,7 +1178,7 @@ def main():
                 # Taskless: include recent chat log as project context
                 chat_log = resolve_agent_dir(project_path) / "chat_log.md"
                 if chat_log.exists():
-                    chat_content = chat_log.read_text(encoding="utf-8")
+                    chat_content = chat_log.read_text(encoding="utf-8", errors="replace")
                     max_chat = MAX_CONTEXT_CHARS // 2
                     if len(chat_content) > max_chat:
                         chat_content = "[... truncated ...]\n\n" + chat_content[-max_chat:]
@@ -1457,7 +1457,12 @@ def main():
             if model:
                 from provider.adapters.claude import ClaudeAdapter
                 claude_args += ["--model", ClaudeAdapter._MODEL_MAP.get(model, model)]
-            claude_args += ["--append-system-prompt", system_context, prompt]
+            # Windows: passing system_context as an argv element overflows the
+            # Win32 command-line cap (32,767 chars → WinError 206). `claude -p`
+            # with no positional prompt reads stdin, so pipe context+prompt
+            # instead of putting them on argv. encoding="utf-8" keeps the pipe
+            # (and stdout decode) off the cp1252 locale default on Windows.
+            full_prompt = f"{system_context}\n\n---\n\n{prompt}"
 
             from provider import sandbox as _sandbox
             print(f"Running {review_label} (claude) on {task_path}...", flush=True)
@@ -1466,8 +1471,10 @@ def main():
                 claude_args,
                 project_root=project_path,
                 env=env,
+                input=full_prompt,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
             )
 
         elif backend == "codex":
@@ -1506,6 +1513,7 @@ def main():
                 input=full_prompt,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
             )
 
         elif backend == "antigravity":  # agy
@@ -1540,6 +1548,7 @@ def main():
                 env=agy_env,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
             )
 
         else:  # pi (local Qwen via oMLX)
@@ -1574,6 +1583,7 @@ def main():
                 env=pi_env,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
             )
 
         if result.stdout:
@@ -1628,7 +1638,7 @@ def main():
         spans = []
         current_span = []
         inside = False
-        for line in chat_log.read_text(encoding="utf-8").splitlines():
+        for line in chat_log.read_text(encoding="utf-8", errors="replace").splitlines():
             stripped = line.strip()
             if not inside and open_tag.match(stripped):
                 inside = True
@@ -1785,7 +1795,7 @@ def main():
             r'(?:.*/)?(tasks (?:work|new) .+)$'
         )
         seen = set()
-        for line in bash_history.read_text(encoding="utf-8").splitlines():
+        for line in bash_history.read_text(encoding="utf-8", errors="replace").splitlines():
             m = pattern.match(line)
             if m:
                 cmd = m.group(2)
@@ -1829,7 +1839,7 @@ def main():
                     text = text[:max_line] + "..."
                 entries.append((msg_ts, 0, f"[{msg_id}] {text}"))
 
-        for line in chat_log.read_text(encoding="utf-8").splitlines():
+        for line in chat_log.read_text(encoding="utf-8", errors="replace").splitlines():
             stripped = line.strip()
             if not stripped:
                 continue
@@ -1860,7 +1870,7 @@ def main():
             r'(?:.*/)?(tasks (?:work|new) .+)$'
         )
         seen = set()
-        for line in bash_history.read_text(encoding="utf-8").splitlines():
+        for line in bash_history.read_text(encoding="utf-8", errors="replace").splitlines():
             m = task_pattern.match(line)
             if m:
                 task_cmd = m.group(2)
@@ -1905,7 +1915,7 @@ def main():
         work_re = re.compile(r'tasks work (\d+)')
         transitions = []  # [(timestamp, task_num_or_None)]
         seen = set()
-        for line in bash_history.read_text(encoding="utf-8").splitlines():
+        for line in bash_history.read_text(encoding="utf-8", errors="replace").splitlines():
             m = task_pattern.match(line)
             if m:
                 task_cmd = m.group(2)
@@ -1939,7 +1949,7 @@ def main():
         # Also detect existing tags to avoid double-tagging
         existing_tag = re.compile(r'^<!--\s*/?T\d+\s*-->$')
 
-        lines = chat_log.read_text(encoding="utf-8").splitlines(keepends=True)
+        lines = chat_log.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
         output = []
         current_tag = None  # currently open tag (task number)
         tags_inserted = 0
@@ -2167,7 +2177,7 @@ def main():
                 print("Error: .agent/chat_log.md not found", file=sys.stderr)
                 sys.exit(1)
 
-            log_text = chat_log.read_text(encoding="utf-8")
+            log_text = chat_log.read_text(encoding="utf-8", errors="replace")
             # Parse message blocks: **[MNNN]** [YYYY-MM-DD HH:MM:SS UTC]
             msg_pattern = re.compile(
                 r'^(\*\*\[M\d+\]\*\* \[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC\].*)',
@@ -2352,6 +2362,20 @@ def main():
 
         # 4. Hooks — check .claude/hooks/ (installed) or src/hooks/ (dev repo)
         hooks_dirs = [project_path / "scripts", project_path / ".claude" / "hooks", project_path / "src" / "hooks"]
+        # On a plugin install the hook scripts live at ${CLAUDE_PLUGIN_ROOT}/scripts
+        # (wired via the plugin's hooks.json), not in the project tree. Resolve
+        # that dir too so doctor doesn't false-negative "missing" on every
+        # plugin install even though the gates demonstrably fire.
+        _plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+        if _plugin_root and (Path(_plugin_root) / "scripts").is_dir():
+            hooks_dirs.append(Path(_plugin_root) / "scripts")
+        else:
+            _plugins_home = Path.home() / ".claude" / "plugins"
+            if _plugins_home.exists():
+                _found = sorted(_plugins_home.glob("**/playbook/scripts"),
+                                key=lambda p: p.stat().st_mtime, reverse=True)
+                if _found:
+                    hooks_dirs.append(_found[0])
         for hook_name in ["state-echo-hook", "task-gate-hook"]:
             found = False
             for hooks_dir in hooks_dirs:
@@ -2454,7 +2478,30 @@ def main():
             if cand.exists():
                 gate_lib = cand
                 break
-        if gate_lib:
+        if gate_lib and (sys.platform == "win32" or os.name == "nt"):
+            # Windows: the Python↔bash process-walk convergence this check guards
+            # is inert — both resolvers skip the ancestor scan (disjoint MSYS vs
+            # native PID namespaces, see find_agent_root_pid) and treat
+            # PLAYBOOK_SESSION_ID as authoritative. Verify the Python resolver
+            # honors the env var and report env-authority. We deliberately don't
+            # shell out to bash: MSYS path resolution is unreliable when bash.exe
+            # is spawned from native Python, which would produce a spurious
+            # MISMATCH. The real risk (env not propagating) is surfaced at
+            # runtime by resolve_session_id's one-time warning.
+            probe = "pid-doctor-probe"
+            saved = os.environ.get("PLAYBOOK_SESSION_ID")
+            os.environ["PLAYBOOK_SESSION_ID"] = probe
+            try:
+                py_sid = resolve_session_id()
+            finally:
+                if saved is None:
+                    os.environ.pop("PLAYBOOK_SESSION_ID", None)
+                else:
+                    os.environ["PLAYBOOK_SESSION_ID"] = saved
+            check("session-id: Python ≡ bash resolver", py_sid == probe,
+                  "env-authoritative on Windows (ancestor scan skipped)"
+                  if py_sid == probe else f"Python ignored PLAYBOOK_SESSION_ID: {py_sid!r}")
+        elif gate_lib:
             import subprocess as _sub
             from tasks.core import find_agent_root_pid
             saved = os.environ.pop("PLAYBOOK_SESSION_ID", None)
@@ -2462,7 +2509,7 @@ def main():
                 find_agent_root_pid.cache_clear()
                 py_sid = resolve_session_id()
                 env = {k: v for k, v in os.environ.items() if k != "PLAYBOOK_SESSION_ID"}
-                r = _sub.run(["bash", "-c", f"source {gate_lib} && resolve_session_id"],
+                r = _sub.run(["bash", "-c", f"source '{gate_lib.as_posix()}' && resolve_session_id"],
                              capture_output=True, text=True, env=env, timeout=5)
                 bash_sid = r.stdout.strip()
             finally:
@@ -2614,7 +2661,7 @@ def main():
         if not chat_log.exists():
             print("Error: .agent/chat_log.md not found", file=sys.stderr)
             sys.exit(1)
-        text = chat_log.read_text(encoding="utf-8")
+        text = chat_log.read_text(encoding="utf-8", errors="replace")
         blocks = text.split("\n---\n")
         lines = []
         for block in blocks:

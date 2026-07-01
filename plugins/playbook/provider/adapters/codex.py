@@ -83,7 +83,7 @@ class CodexAdapter(ProviderAdapter):
             project_root=self._project_root,
             env=env,
             input=inv.stdin, capture_output=True, text=True,
-            timeout=timeout_secs,
+            timeout=timeout_secs, encoding="utf-8",
         )
         return _sandbox.format_judge_output(result)
 

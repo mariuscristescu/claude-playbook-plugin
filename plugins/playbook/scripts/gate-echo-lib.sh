@@ -44,6 +44,17 @@ find_project_root() {
 # same `ps` tree and converge on the same PID. Used as fallback when
 # PLAYBOOK_SESSION_ID env var isn't propagated.
 find_agent_root_pid() {
+    # Windows/MSYS: the ancestor scan is non-functional — Git-Bash `ps` has no
+    # `-o` flag, and MSYS vs native-Windows PID namespaces are disjoint. Skip it
+    # (mirrors the win32 guard in core.py find_agent_root_pid) and let
+    # resolve_session_id fall back to PLAYBOOK_SESSION_ID / $PPID. POSIX is
+    # untouched: the guard only matches MSYS/Cygwin/MinGW shells.
+    case "${OSTYPE:-}" in
+        msys*|cygwin*) echo ""; return 0 ;;
+    esac
+    case "$(uname -s 2>/dev/null)" in
+        MINGW*|MSYS*|CYGWIN*) echo ""; return 0 ;;
+    esac
     local pid=$PPID
     local last_agent=""
     local count=0

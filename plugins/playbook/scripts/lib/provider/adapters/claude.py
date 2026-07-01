@@ -80,13 +80,17 @@ class ClaudeAdapter(ProviderAdapter):
         stream: bool = False,
     ) -> Invocation:
         # Bypass flag injected by provider.sandbox.run() — don't pass here.
+        # Prompt + context go on STDIN, not argv: `claude -p` with no positional
+        # prompt reads stdin. Windows caps the entire command line at 32,767
+        # chars (WinError 206), so a populated system context on argv overflows
+        # it and the process never spawns. All callers (run_headless_judge,
+        # subagent run/stream) already pipe inv.stdin.
         model_arg = self._MODEL_MAP.get(model, model) if model else "sonnet"
-        argv = ["-p", prompt, "--model", model_arg]
-        if context and not bare:
-            argv += ["--append-system-prompt", context]
+        argv = ["-p", "--model", model_arg]
         if stream:
             argv += ["--output-format", "stream-json", "--include-partial-messages"]
-        return Invocation(argv)
+        full_prompt = prompt if (bare or not context) else f"{context}\n\n---\n\n{prompt}"
+        return Invocation(argv, stdin=full_prompt)
 
     def run_headless_judge(
         self,
@@ -121,7 +125,8 @@ class ClaudeAdapter(ProviderAdapter):
             "claude", agent_args,
             project_root=self._project_root,
             env=env,
-            capture_output=True, text=True, timeout=timeout_secs,
+            input=inv.stdin,
+            capture_output=True, text=True, timeout=timeout_secs, encoding="utf-8",
         )
         return _sandbox.format_judge_output(result)
 

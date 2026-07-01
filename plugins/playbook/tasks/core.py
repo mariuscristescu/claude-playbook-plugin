@@ -5,6 +5,7 @@ import functools
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 VERSION = "1.3.6"
@@ -22,6 +23,13 @@ def find_agent_root_pid() -> int | None:
     Python and bash both walk the same tree and converge on the same PID.
     Result is cached: process tree is stable for the lifetime of this process.
     """
+    # Windows/MSYS: this ancestor scan is non-functional and must be skipped.
+    # Git-Bash `ps` has no `-o` flag (breaks on the first call), and MSYS vs
+    # native-Windows PID namespaces are disjoint — there is no walkable path
+    # from a hook/CLI subprocess up to claude.exe. Return None and let
+    # resolve_session_id() lean on PLAYBOOK_SESSION_ID. POSIX is untouched.
+    if sys.platform == "win32" or os.name == "nt":
+        return None
     pid = os.getppid()
     last_agent_pid: int | None = None
     for _ in range(20):
@@ -63,10 +71,28 @@ def resolve_session_id() -> str:
     sid = os.environ.get("PLAYBOOK_SESSION_ID", "")
     if sid:
         return sid
+    # On Windows the ancestor scan is skipped (see find_agent_root_pid), so
+    # PLAYBOOK_SESSION_ID is authoritative — warn once when it's missing.
+    if sys.platform == "win32" or os.name == "nt":
+        _warn_windows_session_id_once()
     agent_pid = find_agent_root_pid()
     if agent_pid is not None:
         return f"pid-{agent_pid}"
     return f"pid-{os.getppid()}"
+
+
+@functools.lru_cache(maxsize=1)
+def _warn_windows_session_id_once() -> None:
+    """Emit a one-time stderr warning that Windows session-id namespacing relies
+    on PLAYBOOK_SESSION_ID (the ancestor process-walk can't run there)."""
+    print(
+        "[playbook] PLAYBOOK_SESSION_ID is not set. On Windows the session id "
+        "falls back to the parent PID and can differ between the Python CLI and "
+        "the bash hooks (split-brain). Set env.BASH_ENV in ~/.claude/settings.json "
+        "so the id propagates. Sessions are not uniquely namespaced on Windows "
+        "(fine for one session at a time, would collide with concurrent sessions).",
+        file=sys.stderr,
+    )
 
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
 

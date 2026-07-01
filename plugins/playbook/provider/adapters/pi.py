@@ -110,11 +110,14 @@ class PiAdapter(ProviderAdapter):
         env = os.environ.copy()
         env["PLAYBOOK_SESSION_ID"] = self._session_id or "judge"
         from provider import sandbox as _sandbox
+        # pi takes its prompt as the `-p <prompt>` flag value (no stdin read),
+        # so context stays on argv here; encoding="utf-8" still guards the
+        # stdout decode against the Windows cp1252 locale default.
         result = _sandbox.run(
             "pi", inv.argv,
             project_root=self._project_root,
             env=env,
-            capture_output=True, text=True, timeout=timeout_secs,
+            capture_output=True, text=True, timeout=timeout_secs, encoding="utf-8",
         )
         return _sandbox.format_judge_output(result)
 

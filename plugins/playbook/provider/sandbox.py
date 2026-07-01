@@ -596,6 +596,9 @@ def popen(
 
     kwargs.setdefault("stdout", subprocess.PIPE)
     kwargs.setdefault("text", True)
+    # utf-8 (not the Windows cp1252 locale default) so piped stdin (e.g. the
+    # claude prompt now on stdin) encodes and stream-json stdout decodes cleanly.
+    kwargs.setdefault("encoding", "utf-8")
     return subprocess.Popen(
         wrapped,
         cwd=str(project),
