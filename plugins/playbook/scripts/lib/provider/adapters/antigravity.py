@@ -77,12 +77,17 @@ class AntigravityAdapter(ProviderAdapter):
         bare: bool = False,
         stream: bool = False,
     ) -> Invocation:
-        # agy v1.0.2 quirks: prompt via --print flag (not stdin); --print mode
-        # ignores cwd so --add-dir exposes the project tree; no model flag.
-        # Bypass flag (--dangerously-skip-permissions) prepended by sandbox.
+        # Prompt + context go on STDIN, not argv: `agy --print` with no
+        # positional prompt reads stdin (verified empirically on agy >=1.0.15;
+        # the earlier "no stdin" note here was wrong). Windows caps the entire
+        # command line at 32,767 chars (WinError 206), so a populated system
+        # context on argv overflows it and the process never spawns — same fix
+        # as the claude adapter. --print mode ignores cwd so --add-dir exposes
+        # the project tree; no model flag. Bypass flag
+        # (--dangerously-skip-permissions) prepended by sandbox.
         full_prompt = prompt if (bare or not context) else f"{context}\n\n---\n\n{prompt}"
-        argv = ["--add-dir", str(self._project_root), "--print", full_prompt]
-        return Invocation(argv)
+        argv = ["--add-dir", str(self._project_root), "--print"]
+        return Invocation(argv, stdin=full_prompt)
 
     def run_headless_judge(
         self,
@@ -102,13 +107,15 @@ class AntigravityAdapter(ProviderAdapter):
         env = os.environ.copy()
         env["PLAYBOOK_SESSION_ID"] = self._session_id or "judge"
         from provider import sandbox as _sandbox
-        # agy takes its prompt via the `--print <prompt>` flag (not stdin, per
-        # the headless_argv note), so context stays on argv; encoding="utf-8"
-        # guards the stdout decode against the Windows cp1252 locale default.
+        # Prompt+context are piped via stdin (see headless_argv — Win32 32,767
+        # char argv cap, mirrors the claude adapter); encoding="utf-8" guards
+        # the stdin pipe and stdout decode against the Windows cp1252 locale
+        # default.
         result = _sandbox.run(
             "agy", agent_args,
             project_root=self._project_root,
             env=env,
+            input=inv.stdin,
             capture_output=True, text=True, timeout=timeout_secs + 30, encoding="utf-8",
         )
         return _sandbox.format_judge_output(result)
