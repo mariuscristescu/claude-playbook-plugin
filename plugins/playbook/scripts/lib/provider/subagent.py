@@ -89,7 +89,7 @@ def run_subagent(spec: SubagentSpec, *, project_root: Path | str) -> SubagentRes
         spec.agent, inv.argv,
         project_root=project_root,
         input=inv.stdin,
-        capture_output=True, text=True, encoding="utf-8",
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=spec.timeout_secs,
         extra_rw=extra_rw,
         project_writable=project_writable,

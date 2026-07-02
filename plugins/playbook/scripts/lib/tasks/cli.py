@@ -1475,6 +1475,7 @@ def main():
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
+                errors="replace",
             )
 
         elif backend == "codex":
@@ -1514,6 +1515,7 @@ def main():
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
+                errors="replace",
             )
 
         elif backend == "antigravity":  # agy
@@ -1554,6 +1556,7 @@ def main():
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
+                errors="replace",
             )
 
         else:  # pi (local Qwen via oMLX)
@@ -1589,6 +1592,7 @@ def main():
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
+                errors="replace",
             )
 
         if result.stdout:
@@ -2484,15 +2488,16 @@ def main():
                 gate_lib = cand
                 break
         if gate_lib and (sys.platform == "win32" or os.name == "nt"):
-            # Windows: the Python↔bash process-walk convergence this check guards
-            # is inert — both resolvers skip the ancestor scan (disjoint MSYS vs
-            # native PID namespaces, see find_agent_root_pid) and treat
-            # PLAYBOOK_SESSION_ID as authoritative. Verify the Python resolver
-            # honors the env var and report env-authority. We deliberately don't
-            # shell out to bash: MSYS path resolution is unreliable when bash.exe
-            # is spawned from native Python, which would produce a spurious
-            # MISMATCH. The real risk (env not propagating) is surfaced at
-            # runtime by resolve_session_id's one-time warning.
+            # Windows: the process-walk is skipped by both resolvers (disjoint
+            # MSYS vs native PID namespaces, see find_agent_root_pid). Two
+            # assertions: (1) the env-set path honors PLAYBOOK_SESSION_ID;
+            # (2) the env-UNSET path returns the shared constant
+            # 'pid-win-fallback' and gate-echo-lib.sh carries the same literal
+            # — that constant is the only thing preventing split-brain when the
+            # env var doesn't propagate. We deliberately don't shell out to
+            # bash: MSYS path resolution is unreliable when bash.exe is spawned
+            # from native Python, which would produce a spurious MISMATCH; the
+            # static literal check covers the bash side instead.
             probe = "pid-doctor-probe"
             saved = os.environ.get("PLAYBOOK_SESSION_ID")
             os.environ["PLAYBOOK_SESSION_ID"] = probe
@@ -2506,6 +2511,20 @@ def main():
             check("session-id: Python ≡ bash resolver", py_sid == probe,
                   "env-authoritative on Windows (ancestor scan skipped)"
                   if py_sid == probe else f"Python ignored PLAYBOOK_SESSION_ID: {py_sid!r}")
+            saved = os.environ.pop("PLAYBOOK_SESSION_ID", None)
+            try:
+                py_fallback = resolve_session_id()
+            finally:
+                if saved is not None:
+                    os.environ["PLAYBOOK_SESSION_ID"] = saved
+            bash_has_const = "pid-win-fallback" in gate_lib.read_text(
+                encoding="utf-8", errors="replace")
+            fallback_ok = py_fallback == "pid-win-fallback" and bash_has_const
+            check("session-id: env-unset fallback converges", fallback_ok,
+                  "both resolvers use constant 'pid-win-fallback'"
+                  if fallback_ok else
+                  f"Python fallback {py_fallback!r}; bash literal present: {bash_has_const}"
+                  " — split-brain risk when PLAYBOOK_SESSION_ID is unset")
         elif gate_lib:
             import subprocess as _sub
             from tasks.core import find_agent_root_pid

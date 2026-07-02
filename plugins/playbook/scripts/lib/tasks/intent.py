@@ -80,7 +80,7 @@ def collect_chat(agent_dir: Path, task_num: str, chat_file: Path | None = None) 
     if chat_file is not None:
         if not chat_file.exists():
             return Slice("chat", "", False, f"--chat-file not found: {chat_file}")
-        return Slice("chat", _trim(chat_file.read_text(encoding="utf-8")),
+        return Slice("chat", _trim(chat_file.read_text(encoding="utf-8", errors="replace")),
                      True, f"--chat-file override: {chat_file}")
 
     chat_log = agent_dir / "chat_log.md"
@@ -92,7 +92,7 @@ def collect_chat(agent_dir: Path, task_num: str, chat_file: Path | None = None) 
     spans: list[str] = []
     current: list[str] = []
     inside = False
-    for line in chat_log.read_text(encoding="utf-8").splitlines():
+    for line in chat_log.read_text(encoding="utf-8", errors="replace").splitlines():
         stripped = line.strip()
         if not inside and open_tag.match(stripped):
             inside = True
@@ -140,7 +140,7 @@ def collect_taskmd(task_dir: Path) -> Slice:
     task_file = task_dir / "task.md"
     if not task_file.exists():
         return Slice("taskmd", "", False, f"no task.md in {task_dir.name}")
-    return Slice("taskmd", _trim(task_file.read_text(encoding="utf-8")),
+    return Slice("taskmd", _trim(task_file.read_text(encoding="utf-8", errors="replace")),
                  True, f"{task_dir.name}/task.md")
 
 
@@ -211,7 +211,7 @@ def _worktree_diff(project_path: Path, pathspec: list[str] | None) -> str:
         if not f.strip():
             continue
         try:
-            content = (project_path / f).read_text(encoding="utf-8")
+            content = (project_path / f).read_text(encoding="utf-8", errors="replace")
         except (OSError, UnicodeDecodeError):
             continue
         blocks.append(f"+++ untracked: {f}\n"
@@ -436,7 +436,7 @@ def append_intent(intent_md: Path, task_num: str, run_id: str, ratified: str) ->
     """
     marker = f"<!-- intent:T{task_num}:{run_id} -->"
     header = "# Validated Intent\n\n_Append-only. Each entry is user-ratified._\n"
-    existing = intent_md.read_text(encoding="utf-8") if intent_md.exists() else header
+    existing = intent_md.read_text(encoding="utf-8", errors="replace") if intent_md.exists() else header
     if marker in existing:
         return  # idempotent — this exact run already ratified
     entry = (f"\n## task {task_num} · {run_id}\n{marker}\n\n{ratified.strip()}\n")
@@ -451,7 +451,7 @@ def last_intent_entry(intent_md: Path, task_num: str) -> str | None:
     """
     if not intent_md.exists():
         return None
-    text = intent_md.read_text(encoding="utf-8")
+    text = intent_md.read_text(encoding="utf-8", errors="replace")
     blocks = re.split(r"^## task ", text, flags=re.M)[1:]
     matches = [b for b in blocks if b.startswith(f"{task_num} ·")]
     if not matches:

@@ -43,7 +43,11 @@ _AGENTS_MD_PREFIXES = ("# AGENTS", "You are ", "# Playbook")
 class CodexAdapter(ProviderAdapter):
     """Provider adapter for Codex CLI (OpenAI)."""
 
-    _PANEL_VARIANTS = ["gpt-5.5", "gpt-5.3-codex"]
+    # gpt-5.3-codex removed 2026-07-02: the API rejects it on ChatGPT-account
+    # Codex ("model is not supported when using Codex with a ChatGPT account",
+    # 400) — it failed in every panel run. The gpt-codex alias in models.json
+    # remains for explicit opt-in by API-key users.
+    _PANEL_VARIANTS = ["gpt-5.5"]
 
     def __init__(self, session_id: str, project_root: Path) -> None:
         self._session_id = session_id

@@ -522,7 +522,7 @@ def _scan_gates(task_file: Path) -> tuple[int, int, str | None]:
     first_unchecked_text is None if all gates are done.
     """
     try:
-        lines = task_file.read_text(encoding="utf-8").splitlines()
+        lines = task_file.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return 0, 0, None
 
@@ -668,7 +668,7 @@ def _normalize_prompt(prompt: str) -> str:
 def _migrate_chat_log_if_needed(log_path: Path, counter_path: Path) -> None:
     if not log_path.exists():
         return
-    original = log_path.read_text(encoding="utf-8")
+    original = log_path.read_text(encoding="utf-8", errors="replace")
     if not original.strip():
         return
     if any(_NEW_CHAT_HEADER_RE.match(line) for line in original.splitlines()):
@@ -702,7 +702,7 @@ def _current_chat_counter(log_path: Path, counter_path: Path) -> int:
 
     highest = 0
     if log_path.exists():
-        for line in log_path.read_text(encoding="utf-8").splitlines():
+        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
             match = _NEW_CHAT_HEADER_RE.match(line)
             if match:
                 highest = max(highest, int(match.group(1)))

@@ -71,10 +71,15 @@ def resolve_session_id() -> str:
     sid = os.environ.get("PLAYBOOK_SESSION_ID", "")
     if sid:
         return sid
-    # On Windows the ancestor scan is skipped (see find_agent_root_pid), so
-    # PLAYBOOK_SESSION_ID is authoritative — warn once when it's missing.
+    # On Windows the ancestor scan is skipped (see find_agent_root_pid) and a
+    # PID fallback would split-brain: the Python CLI sees native-Windows PIDs
+    # while the bash hooks see MSYS PIDs — disjoint namespaces, so the CLI
+    # would write .agent/sessions/pid-A/ and the gate hook read pid-B/,
+    # silently disabling gate enforcement. Fall back to a constant shared
+    # verbatim with gate-echo-lib.sh resolve_session_id so both converge.
     if sys.platform == "win32" or os.name == "nt":
         _warn_windows_session_id_once()
+        return "pid-win-fallback"
     agent_pid = find_agent_root_pid()
     if agent_pid is not None:
         return f"pid-{agent_pid}"
@@ -87,10 +92,11 @@ def _warn_windows_session_id_once() -> None:
     on PLAYBOOK_SESSION_ID (the ancestor process-walk can't run there)."""
     print(
         "[playbook] PLAYBOOK_SESSION_ID is not set. On Windows the session id "
-        "falls back to the parent PID and can differ between the Python CLI and "
-        "the bash hooks (split-brain). Set env.BASH_ENV in ~/.claude/settings.json "
-        "so the id propagates. Sessions are not uniquely namespaced on Windows "
-        "(fine for one session at a time, would collide with concurrent sessions).",
+        "falls back to the constant 'pid-win-fallback' shared by the Python CLI "
+        "and the bash hooks, so gate enforcement still works — but sessions are "
+        "not uniquely namespaced (fine for one session at a time, collides "
+        "across concurrent sessions). Set env.BASH_ENV in ~/.claude/settings.json "
+        "so PLAYBOOK_SESSION_ID propagates and each session gets its own id.",
         file=sys.stderr,
     )
 

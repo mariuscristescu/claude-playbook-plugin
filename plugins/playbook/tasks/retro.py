@@ -38,7 +38,7 @@ def extract_tasks(tasks_dir: Path, since: int = 0) -> list[dict]:
         if not task_file.exists():
             continue
 
-        content = task_file.read_text(encoding="utf-8")
+        content = task_file.read_text(encoding="utf-8", errors="replace")
         results.append(_parse_task(num, m.group(2), content))
 
     return results
@@ -164,7 +164,7 @@ def extract_chatlog(path: Path, task_windows: dict[int, tuple[str, str]] | None 
     if not path.exists():
         return []
 
-    content = path.read_text(encoding="utf-8")
+    content = path.read_text(encoding="utf-8", errors="replace")
     messages = []
 
     # Pattern: **[M001]** [2026-02-14 10:14:45 UTC] `HOST`
@@ -226,7 +226,7 @@ def build_task_windows(chatlog_path: Path, bash_history_path: Path | None = None
 
     # Scan chat_log for gate entries: **[G083:42]** [timestamp]
     if chatlog_path.exists():
-        content = chatlog_path.read_text(encoding="utf-8")
+        content = chatlog_path.read_text(encoding="utf-8", errors="replace")
         gate_pattern = re.compile(
             r'\*\*\[G(\d+):\d+\]\*\*\s+\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\s+UTC)?)\]'
         )
@@ -238,7 +238,7 @@ def build_task_windows(chatlog_path: Path, bash_history_path: Path | None = None
 
     # Scan bash_history for 'tasks work <N>' entries
     if bash_history_path and bash_history_path.exists():
-        content = bash_history_path.read_text(encoding="utf-8")
+        content = bash_history_path.read_text(encoding="utf-8", errors="replace")
         work_pattern = re.compile(
             r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+\|\s+\w+\s+\|\s+.*tasks\s+work\s+(\d+)'
         )
@@ -272,7 +272,7 @@ def extract_mindmap(path: Path) -> list[dict]:
     if not path.exists():
         return []
 
-    content = path.read_text(encoding="utf-8")
+    content = path.read_text(encoding="utf-8", errors="replace")
     nodes = []
 
     # Pattern: [N] **Title** — description

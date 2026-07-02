@@ -279,7 +279,9 @@ class AntigravityAdapter(ProviderAdapter):
         """Run `agy --print` for a single non-interactive prompt.
 
         Uses --add-dir to expose the project tree — agy v1.0.2 --print mode
-        runs in its own scratch dir and ignores cwd otherwise.
+        runs in its own scratch dir and ignores cwd otherwise. The prompt is
+        piped via stdin (agy >=1.0.15 reads it with bare --print) to stay
+        under the Win32 32,767-char argv cap, same as headless_argv.
         """
         import uuid
         env = os.environ.copy()
@@ -287,8 +289,10 @@ class AntigravityAdapter(ProviderAdapter):
         env["PLAYBOOK_PROJECT_ROOT"] = str(project_root)
         result = subprocess.run(
             ["agy", "--add-dir", str(project_root),
-             "--print", prompt, "--print-timeout", "300s"],
-            cwd=project_root, env=env, capture_output=True, text=True, **kwargs,
+             "--print", "--print-timeout", "300s"],
+            cwd=project_root, env=env, input=prompt,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            **kwargs,
         )
         return result.stdout
 
