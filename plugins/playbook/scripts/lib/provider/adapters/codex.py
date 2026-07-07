@@ -58,7 +58,10 @@ def _split_reasoning_effort(model: str) -> tuple[str, Optional[str]]:
     if ":" not in model:
         return model, None
     model_id, _, effort = model.rpartition(":")
+    model_id = model_id.strip()
     effort = effort.strip().lower()
+    if not model_id:
+        raise ValueError(f"empty model id in codex model spec {model!r}.")
     if effort not in _REASONING_EFFORTS:
         raise ValueError(
             f"unknown reasoning effort {effort!r} in codex model spec {model!r}. "
