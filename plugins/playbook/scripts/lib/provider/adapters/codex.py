@@ -39,6 +39,33 @@ from ..policy import Decision
 _AGENTS_MD_LENGTH_THRESHOLD = 2000
 _AGENTS_MD_PREFIXES = ("# AGENTS", "You are ", "# Playbook")
 
+# Accepted values for Codex's `model_reasoning_effort` config key.
+_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
+
+
+def _split_reasoning_effort(model: str) -> tuple[str, Optional[str]]:
+    """Split a `model` or `model:effort` spec into (model, effort_or_None).
+
+    Judge specs like `codex:gpt-5.5:medium` (see resolve_judge_spec, which
+    only peels off the leading `provider:`) arrive here with the effort
+    suffix still attached to `model`. No colon means no effort override —
+    Codex then falls back to whatever `~/.codex/config.toml`'s
+    `model_reasoning_effort` says (often "high", which is why uncontrolled
+    panel runs get expensive). Raises ValueError on an unrecognized effort
+    keyword so a typo fails loud instead of being sent to `-m` as a bogus
+    model id.
+    """
+    if ":" not in model:
+        return model, None
+    model_id, _, effort = model.rpartition(":")
+    effort = effort.strip().lower()
+    if effort not in _REASONING_EFFORTS:
+        raise ValueError(
+            f"unknown reasoning effort {effort!r} in codex model spec {model!r}. "
+            f"Use one of: {', '.join(sorted(_REASONING_EFFORTS))}."
+        )
+    return model_id, effort
+
 
 class CodexAdapter(ProviderAdapter):
     """Provider adapter for Codex CLI (OpenAI)."""
@@ -107,7 +134,10 @@ class CodexAdapter(ProviderAdapter):
         full_prompt = prompt if (bare or not context) else f"{context}\n\n---\n\n{prompt}"
         argv = ["exec", "--ephemeral", "--skip-git-repo-check", "-s", "workspace-write"]
         if model:
-            argv += ["-m", model]
+            model_id, effort = _split_reasoning_effort(model)
+            argv += ["-m", model_id]
+            if effort:
+                argv += ["-c", f"model_reasoning_effort={effort}"]
         argv.append("-")
         return Invocation(argv, stdin=full_prompt)
 

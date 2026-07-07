@@ -1493,7 +1493,11 @@ def main():
             # after `exec` by provider.sandbox._compose_agent_argv.
             codex_args = ["exec"]
             if model:
-                codex_args += ["-m", model]
+                from provider.adapters.codex import _split_reasoning_effort
+                model_id, effort = _split_reasoning_effort(model)
+                codex_args += ["-m", model_id]
+                if effort:
+                    codex_args += ["-c", f"model_reasoning_effort={effort}"]
             codex_args += [
                 "-s", "workspace-write",
                 "--ephemeral",

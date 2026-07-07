@@ -1,6 +1,6 @@
 {
-  "_doc": "Model aliases for bin/sandbox --model <alias> AND judge selection. Each alias entry is [agent, canonical_model_or_null, [extra_args]]. 'default_judge' is the single plan/impl-review backend when --backend is omitted (provider or provider:variant). 'panel' is the default panel-review judge set (entries are 'provider:variant' or a bare provider; an alias name also works). Override per-project by shadowing with .agent/models.json; override per-run with --models / --backend / --model. Model strings drift between releases — edit values here when an upstream version changes. Schema is stable; only values move.",
-  "_updated": "2026-07-02",
+  "_doc": "Model aliases for bin/sandbox --model <alias> AND judge selection. Each alias entry is [agent, canonical_model_or_null, [extra_args]]. 'default_judge' is the single plan/impl-review backend when --backend is omitted (provider or provider:variant). 'panel' is the default panel-review judge set (entries are 'provider:variant' or a bare provider; an alias name also works). For codex entries only, the variant accepts an optional ':effort' suffix (minimal|low|medium|high), e.g. 'codex:gpt-5.5:medium' -> `-c model_reasoning_effort=medium` -- without it, Codex falls back to ~/.codex/config.toml's model_reasoning_effort (often 'high', which is why uncapped panel runs get expensive). Override per-project by shadowing with .agent/models.json; override per-run with --models / --backend / --model. Model strings drift between releases — edit values here when an upstream version changes. Schema is stable; only values move.",
+  "_updated": "2026-07-07",
   "default_judge": "codex",
   "panel": ["opus", "sonnet", "haiku", "codex:gpt-5.5", "agy"],
   "aliases": {
