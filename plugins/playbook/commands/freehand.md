@@ -9,10 +9,10 @@ Enter freehand mode for user-directed work without gate pressure.
 
 ## Instructions
 
-Run:
+Run (via the project's wrapper — it resolves the same plugin copy the hooks run):
 
 ```bash
-PYTHONPATH="$(find ~/.claude/plugins -path '*/playbook/scripts/lib' -type d 2>/dev/null | head -1)/.." python3 -m tasks.cli freehand
+.claude/bin/tasks freehand
 ```
 
 If that fails, try the local dev path:

@@ -5,9 +5,9 @@
 #   monitor start [--session-id ID]     launch monitor as a sandboxed claude session
 #   monitor --help                      this help
 #
-# Invoked via the target project's .claude/bin/monitor wrapper, which locates
-# this file in the plugin cache via `find ~/.claude/plugins`. Sub-scripts live
-# in scripts/monitor-lib/ (sibling directory to this file).
+# Invoked via the target project's .claude/bin/monitor wrapper, which resolves
+# this file from the installed plugin (manifest-first — see create_wrapper in
+# gate-echo-lib.sh). Sub-scripts live in scripts/monitor-lib/ (sibling dir).
 
 set -e
 

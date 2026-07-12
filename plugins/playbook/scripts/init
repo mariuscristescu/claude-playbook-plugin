@@ -33,12 +33,15 @@ fi
 PLAYBOOKS_DIR="$PROJECT_DIR/.agent/playbooks"
 if [ ! -d "$PLAYBOOKS_DIR" ]; then
     mkdir -p "$PLAYBOOKS_DIR"
-    # Copy README from plugin scripts if available
-    PLUGIN_README=$(find ~/.claude/plugins -path '*/playbook/scripts/playbooks-README.md' 2>/dev/null | head -1)
-    if [ -n "$PLUGIN_README" ]; then
-        cp "$PLUGIN_README" "$PLAYBOOKS_DIR/README.md"
-    elif [ -f "$SCRIPT_DIR/playbooks-README.md" ]; then
+    # Copy README from the SAME plugin copy this script runs from (a global
+    # find could mix versions); deterministic sorted find only as fallback.
+    if [ -f "$SCRIPT_DIR/playbooks-README.md" ]; then
         cp "$SCRIPT_DIR/playbooks-README.md" "$PLAYBOOKS_DIR/README.md"
+    else
+        PLUGIN_README=$(find ~/.claude/plugins -path '*/playbook/scripts/playbooks-README.md' 2>/dev/null | sort | head -1)
+        if [ -n "$PLUGIN_README" ]; then
+            cp "$PLUGIN_README" "$PLAYBOOKS_DIR/README.md"
+        fi
     fi
     CREATED+=(".agent/playbooks/")
 else
@@ -218,13 +221,13 @@ MONITOR_HOOK_SRC=""
 if [ -d "$SCRIPT_DIR/monitor-lib" ]; then
     MONITOR_LIB_DIR="$SCRIPT_DIR/monitor-lib"
 else
-    MONITOR_LIB_DIR=$(find ~/.claude/plugins -path '*/playbook/scripts/monitor-lib' -type d 2>/dev/null | head -1)
+    MONITOR_LIB_DIR=$(find ~/.claude/plugins -path '*/playbook/scripts/monitor-lib' -type d 2>/dev/null | sort | head -1)
 fi
 # monitor-nudge.sh ships in hooks/ (parent of scripts/).
 if [ -f "$SCRIPT_DIR/../hooks/monitor-nudge.sh" ]; then
     MONITOR_HOOK_SRC="$SCRIPT_DIR/../hooks/monitor-nudge.sh"
 else
-    MONITOR_HOOK_SRC=$(find ~/.claude/plugins -path '*/playbook/hooks/monitor-nudge.sh' -type f 2>/dev/null | head -1)
+    MONITOR_HOOK_SRC=$(find ~/.claude/plugins -path '*/playbook/hooks/monitor-nudge.sh' -type f 2>/dev/null | sort | head -1)
 fi
 
 if [ -n "$MONITOR_LIB_DIR" ] && [ -d "$MONITOR_LIB_DIR" ]; then

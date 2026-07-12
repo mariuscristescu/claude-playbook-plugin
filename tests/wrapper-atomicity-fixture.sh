@@ -7,6 +7,9 @@
 # mid in-place write. The fix writes to a PID-private temp and atomically renames
 # into place, plus self-heals any already-empty wrapper on the next PreToolUse.
 #
+# The R group (task 010) covers wrapper RESOLUTION: manifest-first, scope-aware,
+# version-deterministic pick of the plugin copy to exec — see the R-group header.
+#
 # Run from anywhere: `bash claude-playbook-plugin/tests/wrapper-atomicity-fixture.sh`.
 # Exits 0 if every scenario passes, non-zero on the first failing assertion.
 
@@ -142,6 +145,170 @@ S7="$WORK/s7"; mkdir -p "$S7/.claude/bin"
 assert_wrapper_healthy "$S7/.claude/bin/tasks" tasks "S7 empty allowlist wrapper healed"
 if [ -s "$S7/.claude/bin/my-notes" ]; then fail "S7 non-allowlist file was written"; else pass "S7 non-allowlist empty file left untouched"; fi
 if [ -e "$S7/.claude/bin/monitor" ]; then fail "S7 absent wrapper was created (should only heal existing)"; else pass "S7 absent wrapper not created"; fi
+
+# ===========================================================================
+# R group — wrapper RESOLUTION scenarios (task 010): the generated wrapper must
+# pick the SAME plugin copy the harness hooks run (installed_plugins.json's
+# installPath), scope-aware and version-deterministic, degrading to a
+# filesystem scan that prefers versioned cache dirs over marketplace clones.
+#
+# Real installed_plugins.json schema (observed live on Claude Code, 2026-07):
+#   { "version": 2,
+#     "plugins": {
+#       "playbook@claude-playbook-marketplace": [
+#         { "scope": "user" | "project" | "local",
+#           "projectPath": "/abs/project",   # only on project-pinned entries
+#           "installPath": "~/.claude/plugins/cache/<mkt>/playbook/<version>",
+#           "version": "1.3.5" | "unknown",
+#           "installedAt": "2026-06-29T08:48:29.933Z",
+#           "lastUpdated": "2026-07-12T21:05:34.018Z" } ] } }
+# Each scenario builds a fake $HOME/.claude/plugins tree; stub scripts echo $0
+# so we can assert exactly which copy the wrapper exec'd.
+# ===========================================================================
+
+# mk_stub DIR — create DIR/tasks that prints its own path
+mk_stub() {
+    mkdir -p "$1"
+    printf '#!/bin/bash\necho "$0"\n' > "$1/tasks"
+    chmod +x "$1/tasks"
+}
+
+# mk_res_env NAME — fresh fake home + project with a freshly generated wrapper.
+# Sets: RHOME (fake home), RPLUG (fake plugins root), RPROJ (project), RW (wrapper)
+mk_res_env() {
+    local base="$WORK/$1"
+    RHOME="$base/home"; RPLUG="$RHOME/.claude/plugins"; RPROJ="$base/proj"
+    mkdir -p "$RPLUG" "$RPROJ"
+    ( source "$LIB"; create_wrapper "$RPROJ" tasks )
+    RW="$RPROJ/.claude/bin/tasks"
+}
+
+# resolve_with_home — run the wrapper under the fake home, capture stdout
+resolve_with_home() { HOME="$RHOME" "$RW" 2>/dev/null; }
+
+# ---------------------------------------------------------------------------
+# R1 — manifest entry (user scope) beats a marketplace clone, even older-mtime.
+# ---------------------------------------------------------------------------
+mk_res_env r1
+mk_stub "$RPLUG/cache/mkt/playbook/2.0.0/scripts"
+mk_stub "$RPLUG/marketplaces/mkt/plugins/playbook/scripts"
+cat > "$RPLUG/installed_plugins.json" <<EOF
+{"version": 2, "plugins": {"playbook@mkt": [{"scope": "user", "installPath": "$RPLUG/cache/mkt/playbook/2.0.0", "version": "2.0.0", "lastUpdated": "2026-07-13T00:00:00.000Z"}]}}
+EOF
+GOT="$(resolve_with_home)"
+if [ "$GOT" = "$RPLUG/cache/mkt/playbook/2.0.0/scripts/tasks" ]; then pass "R1 manifest installPath wins over clone"; else fail "R1 got: $GOT"; fi
+# R1b — arguments are forwarded verbatim to the resolved script.
+printf '#!/bin/bash\necho "args:$*"\n' > "$RPLUG/cache/mkt/playbook/2.0.0/scripts/tasks"
+GOT="$(HOME="$RHOME" "$RW" hello world 2>/dev/null)"
+if [ "$GOT" = "args:hello world" ]; then pass "R1b args forwarded to resolved script"; else fail "R1b got: $GOT"; fi
+
+# ---------------------------------------------------------------------------
+# R2 — NO manifest: scan prefers the versioned cache over the clone tip.
+# ---------------------------------------------------------------------------
+mk_res_env r2
+mk_stub "$RPLUG/cache/mkt/playbook/1.4.0/scripts"
+mk_stub "$RPLUG/marketplaces/mkt/plugins/playbook/scripts"
+GOT="$(resolve_with_home)"
+if [ "$GOT" = "$RPLUG/cache/mkt/playbook/1.4.0/scripts/tasks" ]; then pass "R2 scan prefers versioned cache over clone"; else fail "R2 got: $GOT"; fi
+
+# ---------------------------------------------------------------------------
+# R3 — manifest entry with DANGLING installPath: falls through to the scan.
+# ---------------------------------------------------------------------------
+mk_res_env r3
+mk_stub "$RPLUG/marketplaces/mkt/plugins/playbook/scripts"
+cat > "$RPLUG/installed_plugins.json" <<EOF
+{"version": 2, "plugins": {"playbook@mkt": [{"scope": "user", "installPath": "$RPLUG/cache/mkt/playbook/9.9.9", "version": "9.9.9"}]}}
+EOF
+GOT="$(resolve_with_home)"
+if [ "$GOT" = "$RPLUG/marketplaces/mkt/plugins/playbook/scripts/tasks" ]; then pass "R3 dangling installPath falls through to scan"; else fail "R3 got: $GOT"; fi
+
+# ---------------------------------------------------------------------------
+# R4 — numeric (not lexical) version pick: 1.10.0 beats 1.2.0 in BOTH JSON orders.
+# ---------------------------------------------------------------------------
+for order in ab ba; do
+    mk_res_env "r4$order"
+    mk_stub "$RPLUG/cache/a/playbook/1.2.0/scripts"
+    mk_stub "$RPLUG/cache/b/playbook/1.10.0/scripts"
+    EA="{\"scope\": \"user\", \"installPath\": \"$RPLUG/cache/a/playbook/1.2.0\", \"version\": \"1.2.0\"}"
+    EB="{\"scope\": \"user\", \"installPath\": \"$RPLUG/cache/b/playbook/1.10.0\", \"version\": \"1.10.0\"}"
+    if [ "$order" = ab ]; then
+        printf '{"version": 2, "plugins": {"playbook@a": [%s], "playbook@b": [%s]}}\n' "$EA" "$EB" > "$RPLUG/installed_plugins.json"
+    else
+        printf '{"version": 2, "plugins": {"playbook@b": [%s], "playbook@a": [%s]}}\n' "$EB" "$EA" > "$RPLUG/installed_plugins.json"
+    fi
+    GOT="$(resolve_with_home)"
+    if [ "$GOT" = "$RPLUG/cache/b/playbook/1.10.0/scripts/tasks" ]; then pass "R4($order) 1.10.0 beats 1.2.0 (numeric sort)"; else fail "R4($order) got: $GOT"; fi
+done
+
+# ---------------------------------------------------------------------------
+# R5 — malformed manifest JSON: silent scan fallback, nothing leaked on stderr.
+# ---------------------------------------------------------------------------
+mk_res_env r5
+mk_stub "$RPLUG/cache/mkt/playbook/1.0.0/scripts"
+echo '{ this is not json' > "$RPLUG/installed_plugins.json"
+ERRFILE="$WORK/r5/stderr"
+GOT="$(HOME="$RHOME" "$RW" 2>"$ERRFILE")"
+if [ "$GOT" = "$RPLUG/cache/mkt/playbook/1.0.0/scripts/tasks" ]; then pass "R5 malformed JSON falls back to scan"; else fail "R5 got: $GOT"; fi
+if [ -s "$ERRFILE" ]; then fail "R5 stderr not silent: $(head -1 "$ERRFILE")"; else pass "R5 stderr silent on malformed JSON"; fi
+
+# ---------------------------------------------------------------------------
+# R6 — a project-pinned entry for ANOTHER project is never eligible: the
+# user-scope entry wins despite a (much) higher pinned version.
+# ---------------------------------------------------------------------------
+mk_res_env r6
+mk_stub "$RPLUG/cache/mkt/playbook/9.0.0/scripts"
+mk_stub "$RPLUG/cache/mkt/playbook/1.0.0/scripts"
+cat > "$RPLUG/installed_plugins.json" <<EOF
+{"version": 2, "plugins": {"playbook@mkt": [
+  {"scope": "project", "projectPath": "/somewhere/else/entirely", "installPath": "$RPLUG/cache/mkt/playbook/9.0.0", "version": "9.0.0"},
+  {"scope": "user", "installPath": "$RPLUG/cache/mkt/playbook/1.0.0", "version": "1.0.0"}
+]}}
+EOF
+GOT="$(resolve_with_home)"
+if [ "$GOT" = "$RPLUG/cache/mkt/playbook/1.0.0/scripts/tasks" ]; then pass "R6 other project's pin ignored, user scope wins"; else fail "R6 got: $GOT"; fi
+
+# ---------------------------------------------------------------------------
+# R7 — a project-pinned entry for THIS project outranks a higher user version
+# (mirrors Claude Code scope precedence: the pin IS what hooks run here).
+# ---------------------------------------------------------------------------
+mk_res_env r7
+mk_stub "$RPLUG/cache/mkt/playbook/1.0.0/scripts"
+mk_stub "$RPLUG/cache/mkt/playbook/9.0.0/scripts"
+cat > "$RPLUG/installed_plugins.json" <<EOF
+{"version": 2, "plugins": {"playbook@mkt": [
+  {"scope": "project", "projectPath": "$RPROJ", "installPath": "$RPLUG/cache/mkt/playbook/1.0.0", "version": "1.0.0"},
+  {"scope": "user", "installPath": "$RPLUG/cache/mkt/playbook/9.0.0", "version": "9.0.0"}
+]}}
+EOF
+GOT="$(resolve_with_home)"
+if [ "$GOT" = "$RPLUG/cache/mkt/playbook/1.0.0/scripts/tasks" ]; then pass "R7 this project's pin outranks higher user version"; else fail "R7 got: $GOT"; fi
+
+# ---------------------------------------------------------------------------
+# R8 — version "unknown" (occurs in real manifests): numbered beats unknown;
+# between two unknowns the newer lastUpdated wins.
+# ---------------------------------------------------------------------------
+mk_res_env r8
+mk_stub "$RPLUG/cache/mkt/playbook/3.0.0/scripts"
+mk_stub "$RPLUG/cache/mkt/playbook/unknown/scripts"
+cat > "$RPLUG/installed_plugins.json" <<EOF
+{"version": 2, "plugins": {"playbook@mkt": [
+  {"scope": "user", "installPath": "$RPLUG/cache/mkt/playbook/unknown", "version": "unknown", "lastUpdated": "2026-07-13T00:00:00.000Z"},
+  {"scope": "user", "installPath": "$RPLUG/cache/mkt/playbook/3.0.0", "version": "3.0.0", "lastUpdated": "2026-01-01T00:00:00.000Z"}
+]}}
+EOF
+GOT="$(resolve_with_home)"
+if [ "$GOT" = "$RPLUG/cache/mkt/playbook/3.0.0/scripts/tasks" ]; then pass "R8 numbered version beats unknown"; else fail "R8a got: $GOT"; fi
+mk_res_env r8b
+mk_stub "$RPLUG/cache/a/playbook/unknown/scripts"
+mk_stub "$RPLUG/cache/b/playbook/unknown/scripts"
+cat > "$RPLUG/installed_plugins.json" <<EOF
+{"version": 2, "plugins": {"playbook@mkt": [
+  {"scope": "user", "installPath": "$RPLUG/cache/a/playbook/unknown", "version": "unknown", "lastUpdated": "2026-01-01T00:00:00.000Z"},
+  {"scope": "user", "installPath": "$RPLUG/cache/b/playbook/unknown", "version": "unknown", "lastUpdated": "2026-07-13T00:00:00.000Z"}
+]}}
+EOF
+GOT="$(resolve_with_home)"
+if [ "$GOT" = "$RPLUG/cache/b/playbook/unknown/scripts/tasks" ]; then pass "R8 two unknowns: newer lastUpdated wins"; else fail "R8b got: $GOT"; fi
 
 # ---------------------------------------------------------------------------
 echo "============================================"

@@ -2618,10 +2618,17 @@ def main():
               len(stale_hooks) == 0,
               f"stale paths: {', '.join(stale_hooks[:3])}" if stale_hooks else "clean")
 
-        # 5. Plugin version
+        # 5. Plugin version — read the RUNNING code's own manifest (same tree as
+        # this module), not a global glob: with several cached plugin versions
+        # the glob's [0] is readdir-order nondeterministic (task 010). Dev
+        # layout (src/tasks/) has no sibling manifest -> sorted glob fallback.
         from tasks.core import VERSION as code_version
         installed_version = None
-        plugin_json_paths = list(Path.home().glob(".claude/plugins/**/playbook/.claude-plugin/plugin.json"))
+        own_manifest = Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"
+        if own_manifest.is_file():
+            plugin_json_paths = [own_manifest]
+        else:
+            plugin_json_paths = sorted(Path.home().glob(".claude/plugins/**/playbook/.claude-plugin/plugin.json"))
         if plugin_json_paths:
             import json as _json2
             try:
