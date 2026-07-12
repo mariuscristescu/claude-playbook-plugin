@@ -57,6 +57,13 @@ if [ -n "$PROJECT_DIR" ]; then
         find "$SESSIONS_DIR" -maxdepth 2 -name 'current_state' -mtime +0 \
             -exec dirname {} \; 2>/dev/null | xargs rm -rf 2>/dev/null || true
     fi
+
+    # GC: sweep aged wrapper temps left by a create_wrapper killed between its
+    # write and its atomic rename (>24h so a live writer's fresh tmp is never hit).
+    if [ -d "$PROJECT_DIR/.claude/bin" ]; then
+        find "$PROJECT_DIR/.claude/bin" -maxdepth 1 -name '*.tmp.*' -mtime +0 \
+            -delete 2>/dev/null || true
+    fi
 fi
 
 exit 0

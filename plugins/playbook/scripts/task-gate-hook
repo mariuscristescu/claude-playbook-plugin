@@ -56,6 +56,12 @@ if [ -z "$PROJECT_DIR" ]; then
     exit 0
 fi
 
+# Self-heal any 0-byte wrapper before the tool (esp. a Bash `tasks …` call) runs,
+# so a launcher a pre-fix kill left empty repairs itself on the very invocation
+# that needs it — not one tool call later. `|| true` so it can't trip `set -e`
+# or abort in a read-only sandbox.
+heal_empty_wrappers "$PROJECT_DIR" || true
+
 AGENT_DIR=$(resolve_agent_dir "$PROJECT_DIR")
 
 # State file lives in per-session subdirectory; "default" used when no session_id
