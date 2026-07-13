@@ -1315,6 +1315,14 @@ def main():
         print("=== PENDING TASKS ===")
         list_tasks(project_path, pending_only=True)
 
+        # Judge-pin nudge (task 012): covers projects that predate the models
+        # maintenance loop. Presence check only — no probes at session start.
+        if not (project_path / ".agent" / "models.json").exists():
+            print()
+            print("NOTE: no .agent/models.json — judge panel uses the plugin's shipped")
+            print("defaults, which drift as providers retire models. Relay to the user:")
+            print("pin per-machine judges via `tasks models check` + `tasks models select`.")
+
         # CLI reference — shown last so mind map + tasks aren't buried
         from tasks.template import cli_reference
         print()
@@ -1540,15 +1548,13 @@ def main():
                 print(f"  [{label}] done", flush=True)
 
         # Classify each judge as succeeded vs failed — a failed judge must NOT
-        # read as a clean empty review (T139). Failure markers come from the
-        # adapters' format_judge_output ("(FAILED — exit N)", "(no output)") and
-        # run_judge's own guards ("(timed out…)", "(error:…)").
-        def _judge_failed(text: str) -> bool:
-            t = text.lstrip()
-            return (t.startswith("(FAILED") or t.startswith("(timed out")
-                    or t.startswith("(error") or t == "(no output)")
+        # read as a clean empty review (T139) or a successful one. Shared
+        # predicate (task 012) also catches claude's budget-exhaustion message,
+        # which arrives as exit-0 stdout and previously counted as success.
+        from tasks.models_check import budget_exceeded, judge_failed as _judge_failed
 
         failed = {lbl for lbl, out in results.items() if _judge_failed(out)}
+        over_budget = {lbl for lbl in failed if budget_exceeded(results[lbl])}
         succeeded = len(results) - len(failed)
 
         # Write judge.md (path already set above based on task_file presence)
@@ -1557,6 +1563,8 @@ def main():
         lines.append(f"**Judges:** {succeeded}/{len(results)} succeeded | **Web search:** {'yes' if web_search else 'no'} | **Timeout:** {timeout_secs}s\n")
         if failed:
             lines.append(f"**⚠ Failed judges:** {', '.join(sorted(failed))} — see their blocks below for the exit code / stderr. NOT a clean empty review.\n")
+        if over_budget:
+            lines.append(f"**⚠ Budget-capped judges:** {', '.join(sorted(over_budget))} — hit the ${panel_budget} cap and produced no review. Raise `judge_budget_usd` in `.agent/config.json` or pass `--budget`.\n")
         lines.append("\n")
         # Triage frame (T124): prepend the pushback discipline AT THE TOP so
         # the reading agent meets the instruction BEFORE the per-judge
@@ -1578,7 +1586,53 @@ def main():
         summary = f"\nSaved: {judge_md.relative_to(project_path)} ({succeeded}/{len(judges)} judges succeeded)"
         if failed:
             summary += f"; FAILED: {', '.join(sorted(failed))}"
+        if over_budget:
+            summary += (f"\nBudget notice: {', '.join(sorted(over_budget))} hit the "
+                        f"${panel_budget} cap — raise judge_budget_usd in "
+                        f".agent/config.json or pass --budget to re-run them.")
         print(summary, flush=True)
+
+        # Hard stop on probe-confirmed dead pins (task 012). Pattern
+        # classification alone is only a hint (failure tails can echo prompt
+        # fragments containing the very same signatures); a live probe of the
+        # exact failed spec is what triggers exit 1. judge.md is already
+        # written above, so the review is never lost. Timeout/budget/other
+        # failures keep the soft behavior (exit 0 fall-through).
+        if failed:
+            from tasks.models_check import (
+                NEEDS_CLI_UPGRADE, apply_confirmed, check_pins,
+                confirm_dead_specs, render_report,
+            )
+            label_provider = {}
+            for adapter_cls, variant in judges:
+                provider_name = adapter_cls.binary_name()
+                lbl = f"{provider_name}:{variant}" if variant else provider_name
+                label_provider[lbl] = (provider_name, variant)
+            confirmed = confirm_dead_specs(
+                {lbl: results[lbl] for lbl in failed}, label_provider)
+            if confirmed:
+                print("\nHARD STOP: judge pin(s) unavailable (probe-confirmed):", file=sys.stderr)
+                for lbl in sorted(confirmed):
+                    pv, detail = confirmed[lbl]
+                    fix = ("upgrade the codex CLI (`codex update`)"
+                           if pv == NEEDS_CLI_UPGRADE
+                           else "re-select the panel (`tasks models select`)")
+                    print(f"  {lbl}: {pv} — {detail} → {fix}", file=sys.stderr)
+                print("\nCurrent availability:", file=sys.stderr)
+                report = apply_confirmed(
+                    check_pins(project_path, probe=False, extra_specs=sorted(confirmed)),
+                    confirmed)
+                print(render_report(report), file=sys.stderr)
+                print("\nReview saved to judge.md but the panel is degraded — "
+                      "decide how to proceed before re-running.", file=sys.stderr)
+                sys.exit(1)
+
+    elif cmd == "models":
+        # Model-availability discovery + panel selection (task 012).
+        # `tasks models check [--no-probe]` audits every models.json pin;
+        # `tasks models select [--no-probe]` interactively rewrites the panel.
+        from tasks.models_check import cli_models
+        sys.exit(cli_models(cmd_args, find_project_root()))
 
     elif cmd in ("plan-review", "impl-review", "judge"):
         # "judge" is a legacy alias — auto-detects mode from task status
@@ -1913,7 +1967,24 @@ def main():
         }.get(backend, "judge.log")
         judge_log = task_file.parent / log_name
         output = (result.stdout or "").strip()
-        if result.returncode != 0 and not output:
+        # Budget exhaustion arrives as exit-0 stdout (task 012 L3): detect it
+        # BEFORE saving so it never overwrites a prior good review, tell the
+        # user how to raise the cap, and exit nonzero — it's not a review.
+        from tasks.models_check import budget_exceeded as _budget_exceeded
+        from tasks.models_check import judge_failed as _judge_failed_str
+        if _budget_exceeded(output):
+            kept = (f"; kept previous {judge_log.relative_to(project_path)}"
+                    if judge_log.exists() else "")
+            print(f"\nJudge hit the ${review_budget} budget cap and produced no "
+                  f"review{kept}. Raise judge_budget_usd in .agent/config.json "
+                  f"or pass --budget.", flush=True)
+            sys.exit(1)
+        # Failure-marked output (e.g. claude's bad-model message: stdout WITH
+        # exit 1) is not a review either — never let it overwrite a prior good
+        # log (task 012 I1). The formatted string is what classification below
+        # sees, so save/keep and hard-stop agree on what counts as a failure.
+        _formatted_result = _sandbox.format_judge_output(result)
+        if result.returncode != 0 and (not output or _judge_failed_str(_formatted_result)):
             if judge_log.exists():
                 print(f"\nReview failed (exit {result.returncode}); kept previous {judge_log.relative_to(project_path)}", flush=True)
             else:
@@ -1925,6 +1996,33 @@ def main():
             elif not judge_log.exists() or not judge_log.read_text(encoding="utf-8").strip():
                 judge_log.write_text(result.stdout or "", encoding="utf-8")
             print(f"\nSaved: {judge_log.relative_to(project_path)}", flush=True)
+
+        # Model-unavailable hard stop (task 012), same contract as the panel:
+        # classify the FORMATTED result (both streams survive on nonzero exit
+        # — codex 400s land on stderr, which stdout-only `output` misses),
+        # then probe-confirm the exact spec before hard-stopping. Timeout
+        # (handled above via _bail_review_timeout) and budget paths untouched.
+        from tasks.models_check import (
+            NEEDS_CLI_UPGRADE, apply_confirmed, check_pins, confirm_dead_specs,
+            render_report,
+        )
+        _sj_provider = "agy" if backend == "antigravity" else backend
+        _sj_spec = f"{_sj_provider}:{model}" if model else _sj_provider
+        confirmed = confirm_dead_specs(
+            {_sj_spec: _formatted_result}, {_sj_spec: (_sj_provider, model)})
+        if confirmed:
+            pv, detail = confirmed[_sj_spec]
+            fix = ("upgrade the codex CLI (`codex update`)"
+                   if pv == NEEDS_CLI_UPGRADE
+                   else "re-select the panel (`tasks models select`)")
+            print(f"\nHARD STOP: judge pin unavailable (probe-confirmed):\n"
+                  f"  {_sj_spec}: {pv} — {detail} → {fix}\n\nCurrent availability:",
+                  file=sys.stderr)
+            report = apply_confirmed(
+                check_pins(project_path, probe=False, extra_specs=[_sj_spec]),
+                confirmed)
+            print(render_report(report), file=sys.stderr)
+            sys.exit(1)
 
         sys.exit(result.returncode)
 
@@ -2694,6 +2792,22 @@ def main():
                         warn("config: review_timeout_secs", f"{_rt!r} not a positive integer; default 300s used")
             elif _cfg is not None:
                 warn("config: .agent/config.json shape", "top-level value is not a JSON object; ignored")
+
+        # 1c. Judge pins (.agent/models.json + shipped panel) — advisory only.
+        # Cheap checks: adapter presence + codex cache/effort validation; NO
+        # live probes in doctor (that's `tasks models check`).
+        try:
+            from tasks.models_check import bad_pins, check_pins
+            models_path = project_path / ".agent" / "models.json"
+            if not models_path.exists():
+                warn("models: .agent/models.json", "absent — shipped panel used; "
+                     "create with `tasks models select`")
+            _report = check_pins(project_path, probe=False)
+            for _e in bad_pins(_report):
+                warn(f"models: pin '{_e['spec']}'", f"{_e['verdict']} — {_e['detail']}; "
+                     f"refresh with `tasks models select`")
+        except Exception as e:  # doctor must never crash on an advisory check
+            warn("models: pin check ran", f"skipped ({e})")
 
         # 2. Unicode
         stdout_enc = getattr(sys.stdout, "encoding", "unknown") or "unknown"

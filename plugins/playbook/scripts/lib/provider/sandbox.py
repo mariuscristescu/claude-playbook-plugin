@@ -98,10 +98,15 @@ def _parse_models_json(path: Path) -> dict[str, tuple[str, str | None, tuple[str
     return out
 
 
-def _find_project_models_override() -> Path | None:
-    """Walk up from cwd for a `.agent/models.json`. Returns first hit or None."""
-    cwd = Path.cwd()
-    for d in (cwd, *cwd.parents):
+def _find_project_models_override(start: Path | None = None) -> Path | None:
+    """Walk up from `start` (default cwd) for a `.agent/models.json`.
+
+    Callers that know the project root (tasks CLI) should pass it — the cwd
+    walk-up can resolve a DIFFERENT project's config when invoked from a
+    nested/outside directory (task 012 fable F1).
+    """
+    base = start or Path.cwd()
+    for d in (base, *base.parents):
         candidate = d / ".agent" / "models.json"
         if candidate.is_file():
             return candidate
@@ -186,18 +191,20 @@ def _parse_judge_config(path: Path) -> dict:
     return out
 
 
-def load_judge_config() -> dict:
+def load_judge_config(project_root: Path | None = None) -> dict:
     """Plugin default ⊕ project `.agent/models.json` (project wins per key).
 
     Returns {"default_judge": str | None, "panel": list[str]}.
     A project `panel` REPLACES the shipped panel (not merged) — to add claude
     back, a project lists every judge it wants. Empty/missing → {} defaults.
+    Pass `project_root` when known; otherwise the override is found by cwd
+    walk-up, which can pick up a different project's config (task 012).
     """
     cfg: dict = {}
     default_path = Path(__file__).parent / "models.json"
     if default_path.is_file():
         cfg.update(_parse_judge_config(default_path))
-    override = _find_project_models_override()
+    override = _find_project_models_override(project_root)
     if override:
         cfg.update(_parse_judge_config(override))
     return {"default_judge": cfg.get("default_judge"), "panel": cfg.get("panel", [])}
@@ -236,21 +243,54 @@ def resolve_judge_spec(name: str) -> tuple[str, str | None]:
 
 def format_judge_output(result: subprocess.CompletedProcess) -> str:
     """Render a judge subprocess result so a failure can never masquerade as a
-    clean empty review (the T139 `(no output)` bug).
+    clean empty review (the T139 `(no output)` bug) — or as a SUCCESSFUL one.
 
-    - non-empty stdout → returned verbatim (the review).
-    - empty stdout + non-zero exit → `(FAILED — exit N)` + stderr tail, so the
-      cause (nested-sandbox rc 71, auth, crash) shows up in judge.md.
-    - empty stdout + exit 0 → genuinely empty (`(no output)`).
+    Returncode wins over stdout (task 012): a CLI that exits nonzero after
+    printing progress — or that prints its error to stdout, as claude does
+    with budget-exceeded and bad-model messages — previously had its stdout
+    returned verbatim and read as a clean review. Failure classification
+    (`classify_failure`) runs only over `(FAILED …)`-marked strings, so both
+    streams must survive here.
+
+    - exit != 0 → `(FAILED — exit N)` + labeled stdout/stderr tails (2000
+      chars each), so the cause AND any model-unavailable signature reach
+      judge.md and the classifier.
+    - exit 0 + non-empty stdout → returned verbatim (the review).
+    - exit 0 + empty stdout → genuinely empty (`(no output)`).
     """
-    if result.stdout and result.stdout.strip():
-        return result.stdout
     rc = result.returncode
+    stdout = (result.stdout or "").strip()
     stderr = (result.stderr or "").strip()
     if rc != 0:
-        tail = stderr[-800:] if stderr else "(no stderr captured)"
-        return f"(FAILED — exit {rc})\n{tail}"
+        parts = [f"(FAILED — exit {rc})"]
+        if stdout:
+            parts.append(f"[stdout tail]\n{stdout[-2000:]}")
+        if stderr:
+            parts.append(f"[stderr tail]\n{stderr[-2000:]}")
+        if not stdout and not stderr:
+            parts.append("(no output captured)")
+        # A model-availability signature buried before the truncation point
+        # must still reach the classifier (tasks.models_check.classify_failure
+        # matches these same anchors) — surface the matched line explicitly.
+        block = "\n".join(parts)
+        full = stdout + "\n" + stderr
+        for sig in _AVAILABILITY_SIGNATURES:
+            if sig in full and sig not in block:
+                line = next(ln for ln in full.splitlines() if sig in ln)
+                parts.append(f"[signature] {line.strip()[:400]}")
+        return "\n".join(parts)
+    if stdout:
+        return result.stdout
     return "(no output)"
+
+
+# Model-availability failure anchors, kept in sync with the classification
+# patterns in tasks/models_check.py (live-captured, task 012).
+_AVAILABILITY_SIGNATURES = (
+    "model is not supported",
+    "requires a newer version of Codex",
+    "There's an issue with the selected model",
+)
 
 
 # Top-level paths (non-home) that must be writable.

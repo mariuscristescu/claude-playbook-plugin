@@ -109,9 +109,9 @@ class PiAdapter(ProviderAdapter):
             return f"(error: neither omlx nor pi found on PATH)"
         inv = self.headless_argv(prompt, model, context=system_context)
         # Windows caps the whole command line at 32,767 chars (WinError 206).
-        # pi takes prompt AND context as flag values on argv, and unlike agy
-        # (whose "no stdin" claim proved empirically wrong) a stdin path for pi
-        # is unverified — so fail fast with a clear error instead of a cryptic
+        # pi takes prompt AND context as flag values on argv; like agy 1.1.1
+        # (which has no stdin prompt path — task 013) a stdin path for pi is
+        # unverified — so fail fast with a clear error instead of a cryptic
         # spawn failure when the payload can't fit.
         if os.name == "nt":
             payload = sum(len(a) + 1 for a in inv.argv)

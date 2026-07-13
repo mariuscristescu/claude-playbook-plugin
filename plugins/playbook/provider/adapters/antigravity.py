@@ -77,17 +77,22 @@ class AntigravityAdapter(ProviderAdapter):
         bare: bool = False,
         stream: bool = False,
     ) -> Invocation:
-        # Prompt + context go on STDIN, not argv: `agy --print` with no
-        # positional prompt reads stdin (verified empirically on agy >=1.0.15;
-        # the earlier "no stdin" note here was wrong). Windows caps the entire
-        # command line at 32,767 chars (WinError 206), so a populated system
-        # context on argv overflows it and the process never spawns — same fix
-        # as the claude adapter. --print mode ignores cwd so --add-dir exposes
-        # the project tree; no model flag. Bypass flag
-        # (--dangerously-skip-permissions) prepended by sandbox.
+        # agy 1.1.x `--print`/`--prompt` is a STRING flag: the prompt is its
+        # VALUE, not stdin. (Bare `agy --print` errors "flag needs an argument:
+        # -print"; agy has no stdin prompt path in 1.1.1 — `--print -` just
+        # treats "-" as the literal prompt.) The prompt therefore rides right
+        # after `--print` on argv; keeping it adjacent is load-bearing, because
+        # run_headless_judge appends `--print-timeout <secs>s` afterwards — if
+        # `--print` had no value, it would swallow `--print-timeout` as the
+        # prompt (the bug that made every agy judge investigate the string
+        # "--print-timeout" instead of reviewing; task 013). --print ignores cwd
+        # so --add-dir exposes the project tree; no model flag (rejected).
+        # Bypass flag (--dangerously-skip-permissions) prepended by sandbox.
+        # Windows note: agy has no stdin channel, so a large context can exceed
+        # the 32,767-char cmdline cap — run_headless_judge guards that.
         full_prompt = prompt if (bare or not context) else f"{context}\n\n---\n\n{prompt}"
-        argv = ["--add-dir", str(self._project_root), "--print"]
-        return Invocation(argv, stdin=full_prompt)
+        argv = ["--add-dir", str(self._project_root), "--print", full_prompt]
+        return Invocation(argv, stdin=None)
 
     def run_headless_judge(
         self,
@@ -103,20 +108,30 @@ class AntigravityAdapter(ProviderAdapter):
         if not shutil.which(self.binary_name()):
             return f"(error: {self.binary_name()} not found on PATH)"
         inv = self.headless_argv(prompt, model, context=system_context)
-        # Judge-only extra: --print-timeout (Go-style duration).
+        # Judge-only extra: --print-timeout (Go-style duration). Safe to append
+        # after headless_argv's prompt value — `--print` already has its value,
+        # so this is parsed as its own flag (not swallowed as the prompt).
         agent_args = inv.argv + ["--print-timeout", f"{timeout_secs}s"]
+        # agy 1.1.1 has no stdin prompt path, so prompt+context ride on argv.
+        # Windows caps the whole command line at 32,767 chars (WinError 206) —
+        # fail fast with a clear error instead of a cryptic spawn failure when
+        # a large context can't fit (mirrors the pi adapter).
+        if os.name == "nt":
+            payload = sum(len(a) + 1 for a in agent_args)
+            if payload > 30_000:
+                return (f"(error: agy judge prompt+context is ~{payload} chars on argv; "
+                        "Windows caps the command line at 32,767 chars and agy 1.1.1 reads "
+                        "its prompt from argv only — shrink the context or use another backend)")
         env = os.environ.copy()
         env["PLAYBOOK_SESSION_ID"] = self._session_id or "judge"
         from provider import sandbox as _sandbox
-        # Prompt+context are piped via stdin (see headless_argv — Win32 32,767
-        # char argv cap, mirrors the claude adapter); encoding="utf-8" guards
-        # the stdin pipe and stdout decode against the Windows cp1252 locale
-        # default.
+        # encoding="utf-8" guards the stdout decode against the Windows cp1252
+        # locale default. No stdin (prompt is on argv — see headless_argv).
         result = _sandbox.run(
             "agy", agent_args,
             project_root=self._project_root,
             env=env,
-            input=inv.stdin,
+            input=None,
             capture_output=True, text=True, timeout=timeout_secs + 30, encoding="utf-8",
         )
         return _sandbox.format_judge_output(result)
@@ -277,12 +292,13 @@ class AntigravityAdapter(ProviderAdapter):
         return result.returncode
 
     def launch_headless(self, project_root: Path, prompt: str, **kwargs) -> str:
-        """Run `agy --print` for a single non-interactive prompt.
+        """Run `agy --print <prompt>` for a single non-interactive prompt.
 
-        Uses --add-dir to expose the project tree — agy v1.0.2 --print mode
-        runs in its own scratch dir and ignores cwd otherwise. The prompt is
-        piped via stdin (agy >=1.0.15 reads it with bare --print) to stay
-        under the Win32 32,767-char argv cap, same as headless_argv.
+        Uses --add-dir to expose the project tree — agy --print mode runs in
+        its own scratch dir and ignores cwd otherwise. agy 1.1.x `--print` is a
+        string flag taking the prompt as its value (no stdin path); the prompt
+        must sit immediately after `--print`, before `--print-timeout` (else
+        `--print` swallows `--print-timeout` as its value — see headless_argv).
         """
         import uuid
         env = os.environ.copy()
@@ -290,8 +306,8 @@ class AntigravityAdapter(ProviderAdapter):
         env["PLAYBOOK_PROJECT_ROOT"] = str(project_root)
         result = subprocess.run(
             ["agy", "--add-dir", str(project_root),
-             "--print", "--print-timeout", "300s"],
-            cwd=project_root, env=env, input=prompt,
+             "--print", prompt, "--print-timeout", "300s"],
+            cwd=project_root, env=env,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             **kwargs,
         )

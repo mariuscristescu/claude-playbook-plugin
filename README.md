@@ -105,6 +105,16 @@ Per-install review knobs live in `.agent/config.json` (created by `/playbook:ini
 
 Precedence, highest first: **CLI flag** (`--budget`, `--timeout` on `plan-review` / `impl-review` / `panel-review`) → **env var** (`PLAYBOOK_JUDGE_BUDGET_USD`, `PLAYBOOK_REVIEW_TIMEOUT_SECS`) → **`.agent/config.json`** → built-in default. A missing file or malformed value falls back to the default (surfaced by `tasks doctor`, never fatal).
 
+### Judge model pins (`.agent/models.json`)
+
+Judge selection lives in `models.json`: the plugin ships defaults in `provider/models.json`, and each install can shadow them per key with a gitignored `.agent/models.json` (`default_judge`, `panel`, `aliases`). Pinned model ids rot as providers ship and retire models, so the pins have a maintenance loop:
+
+- `tasks models check` audits every pin against **live availability**: codex pins are probed with a tiny prompt (the `~/.codex/models_cache.json` catalog alone doesn't prove your account can use a model), claude pins are probed budget-capped (claude has no list command — new ids enter via `--claude-candidates`), agy is unverifiable (`--model` is inert in `--print` mode; the judge always runs whatever model is selected in the agy UI). `--no-probe` is the free/fast degraded audit. Exits 1 when any pin can't run as configured.
+- `tasks models select` refreshes interactively: shows the report, takes the new panel + default judge, writes `.agent/models.json` — creating it on fresh installs and preserving keys it doesn't manage.
+- `tasks doctor` warns (never fails) on a missing models.json or dead pins, using the cheap checks only.
+- When a review judge fails **specifically because its model no longer exists** — probe-confirmed, not just pattern-matched — the review still saves its output, then prints the availability report and exits nonzero: a deliberate hard stop so you re-pin before trusting a degraded panel. Timeouts, budget caps, and other errors keep their soft behavior.
+- A judge that exhausts its budget cap is reported as **failed** with an explicit notice (raise `judge_budget_usd` or pass `--budget`) instead of masquerading as a successful empty review.
+
 ## Two agents, one task
 
 One setup that works well: the **orchestrator** runs outside the sandbox - writes plans, reviews results, commits. The **sandbox agent** runs in bypass mode - picks up the task.md and builds. The task.md is the handoff. Different agents across different sessions can pick up the same task and keep going from wherever it stopped.
