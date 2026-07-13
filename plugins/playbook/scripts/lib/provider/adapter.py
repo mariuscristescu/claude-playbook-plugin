@@ -118,11 +118,15 @@ class ProviderAdapter(ABC):
         *,
         web_search: bool,
         timeout_secs: int,
+        budget_usd: str = "2",
     ) -> str:
         """Single non-interactive judge invocation; returns stdout text.
 
         Used by panel-review; each adapter assembles its own command line
         (provider-specific flags, prompt composition, sandbox controls).
+        `budget_usd` caps spend on metered backends — claude only
+        (--max-budget-usd); codex/agy/pi accept it for a uniform signature but
+        have no budget knob.
         Raises subprocess.TimeoutExpired on hang; returns "(no output)" if empty.
         """
 

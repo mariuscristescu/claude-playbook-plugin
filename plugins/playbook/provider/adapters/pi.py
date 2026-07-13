@@ -100,6 +100,7 @@ class PiAdapter(ProviderAdapter):
         *,
         web_search: bool,
         timeout_secs: int,
+        budget_usd: str = "2",
     ) -> str:
         import shutil
         # Prefer omlx (handles config-file setup via os.execvpe), fall back to

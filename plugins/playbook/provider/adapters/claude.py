@@ -100,6 +100,7 @@ class ClaudeAdapter(ProviderAdapter):
         *,
         web_search: bool,
         timeout_secs: int,
+        budget_usd: str = "2",
     ) -> str:
         import shutil
         if not shutil.which(self.binary_name()):
@@ -116,7 +117,7 @@ class ClaudeAdapter(ProviderAdapter):
         inv = self.headless_argv(prompt, model, context=system_context)
         # Judge-only extras layered on the core invocation.
         agent_args = inv.argv + [
-            "--max-budget-usd", "2",
+            "--max-budget-usd", budget_usd,
             "--tools", tools,
             "--allowedTools", tools,
         ]

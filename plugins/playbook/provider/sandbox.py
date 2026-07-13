@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -570,6 +571,15 @@ def run(
         # kills the stdin writer thread. Pin UTF-8; tolerate stray bytes out.
         kwargs.setdefault("encoding", "utf-8")
         kwargs.setdefault("errors", "replace")
+
+    # A plain subprocess.run(timeout=) only SIGKILLs the direct child on expiry;
+    # a sandboxed agent's grandchildren keep the captured pipe open, so the
+    # post-kill communicate() blocks forever (observed: a 1s judge timeout hung
+    # for minutes). When a timeout is requested, run under our own process group
+    # and terminate the whole tree on expiry instead.
+    if kwargs.get("timeout") is not None:
+        return _run_with_timeout(wrapped, project, child_env, capture_output, check, kwargs)
+
     return subprocess.run(
         wrapped,
         cwd=str(project),
@@ -578,6 +588,58 @@ def run(
         check=check,
         **kwargs,
     )
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Best-effort terminate the agent AND its descendants. Grandchildren
+    otherwise survive a lone proc.kill() and hold captured pipes open. POSIX:
+    signal the whole process group; Windows: taskkill /T walks the child tree."""
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, check=False,
+            )
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def _run_with_timeout(wrapped, project, child_env, capture_output, check, kwargs):
+    """run() helper: timeout-bounded execution with whole-tree termination.
+    Re-raises subprocess.TimeoutExpired on expiry (after killing the tree) so
+    callers can catch it exactly as they would from subprocess.run()."""
+    timeout = kwargs.pop("timeout")
+    input_data = kwargs.pop("input", None)
+    if capture_output:
+        kwargs.setdefault("stdout", subprocess.PIPE)
+        kwargs.setdefault("stderr", subprocess.PIPE)
+    if input_data is not None:
+        kwargs.setdefault("stdin", subprocess.PIPE)
+    # Own process group / job so the whole tree is signalable, not just the leader.
+    if os.name == "nt":
+        kwargs.setdefault("creationflags", subprocess.CREATE_NEW_PROCESS_GROUP)
+    else:
+        kwargs.setdefault("start_new_session", True)
+
+    proc = subprocess.Popen(wrapped, cwd=str(project), env=child_env, **kwargs)
+    try:
+        out, err = proc.communicate(input=input_data, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        try:
+            proc.communicate(timeout=5)  # reap; tree is dead so returns promptly
+        except Exception:
+            pass
+        raise
+    if check and proc.returncode:
+        raise subprocess.CalledProcessError(proc.returncode, wrapped, out, err)
+    return subprocess.CompletedProcess(wrapped, proc.returncode, out, err)
 
 
 def popen(

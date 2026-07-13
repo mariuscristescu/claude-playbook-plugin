@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import functools
+import json
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "1.3.6"
+VERSION = "1.3.7"
 
 AGENT_PROCESS_NAMES = frozenset({"claude", "codex", "agy", "pi"})
 
@@ -128,6 +129,81 @@ def resolve_agent_dir(project_path: Path) -> Path:
     name = marker.read_text(encoding="utf-8").strip()
     _validate_username(name)
     return project_path / ".agent" / name
+
+
+# ── Per-install configuration (.agent/config.json) ──────────────────────────
+# Install-wide review knobs, read at the .agent/ ROOT (not the per-user subdir —
+# budget and review timeout are per-install, shared across users in a multi-user
+# repo). Precedence for every setting: CLI flag > env var > config.json >
+# built-in default. A missing file, malformed JSON, or an out-of-range value
+# never crashes the CLI — it falls back to the default (warning once).
+
+DEFAULT_JUDGE_BUDGET_USD = "2"
+DEFAULT_REVIEW_TIMEOUT_SECS = 300
+
+
+def load_config(project_path: Path) -> dict:
+    """Return the parsed .agent/config.json (install root), or {} if absent or
+    unparseable. Never raises — config is advisory, not load-bearing."""
+    cfg = project_path / ".agent" / "config.json"
+    if not cfg.exists():
+        return {}
+    try:
+        data = json.loads(cfg.read_text(encoding="utf-8", errors="replace"))
+    except (ValueError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_bad_config_value_once(source: str, raw: str) -> None:
+    print(
+        f"[playbook] review setting from {source}={raw!r} is not valid — "
+        "using the built-in default instead.",
+        file=sys.stderr,
+    )
+
+
+def resolve_judge_budget(project_path: Path) -> str:
+    """Resolve the claude judge --max-budget-usd value (USD).
+    Precedence: PLAYBOOK_JUDGE_BUDGET_USD env > config.json judge_budget_usd >
+    "2". Returned as a str for direct argv use. Non-numeric / negative → default.
+    (claude-only; codex/agy/pi have no budget knob.)"""
+    raw = os.environ.get("PLAYBOOK_JUDGE_BUDGET_USD")
+    source = "PLAYBOOK_JUDGE_BUDGET_USD"
+    if raw is None:
+        val = load_config(project_path).get("judge_budget_usd")
+        if val is None:
+            return DEFAULT_JUDGE_BUDGET_USD
+        raw, source = str(val), "config.json judge_budget_usd"
+    try:
+        if float(raw) < 0:
+            raise ValueError
+        return raw
+    except (TypeError, ValueError):
+        _warn_bad_config_value_once(source, raw)
+        return DEFAULT_JUDGE_BUDGET_USD
+
+
+def resolve_review_timeout(project_path: Path) -> int:
+    """Resolve the review-agent subprocess timeout in seconds.
+    Precedence: PLAYBOOK_REVIEW_TIMEOUT_SECS env > config.json
+    review_timeout_secs > 300. Non-numeric / non-positive → default."""
+    raw = os.environ.get("PLAYBOOK_REVIEW_TIMEOUT_SECS")
+    source = "PLAYBOOK_REVIEW_TIMEOUT_SECS"
+    if raw is None:
+        val = load_config(project_path).get("review_timeout_secs")
+        if val is None:
+            return DEFAULT_REVIEW_TIMEOUT_SECS
+        raw, source = str(val), "config.json review_timeout_secs"
+    try:
+        secs = int(raw)
+        if secs <= 0:
+            raise ValueError
+        return secs
+    except (TypeError, ValueError):
+        _warn_bad_config_value_once(source, raw)
+        return DEFAULT_REVIEW_TIMEOUT_SECS
 
 
 # Task type → pattern name in playbook skill

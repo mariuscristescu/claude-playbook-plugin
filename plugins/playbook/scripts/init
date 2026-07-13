@@ -48,6 +48,26 @@ else
     SKIPPED+=(".agent/playbooks/ (exists)")
 fi
 
+# --- (a3) .agent/config.json — per-install review knobs ---
+# Install-wide, hand-editable. Precedence for each setting: CLI flag > env var >
+# this file > built-in default. Only written when absent — never clobbers a
+# user-tuned file. (Values here are the built-in defaults, spelled out so the
+# knobs are discoverable.)
+CONFIG_JSON="$PROJECT_DIR/.agent/config.json"
+if [ ! -f "$CONFIG_JSON" ]; then
+    mkdir -p "$PROJECT_DIR/.agent"
+    cat > "$CONFIG_JSON" <<'CONFIG'
+{
+  "_doc": "Per-install playbook review settings. Precedence: CLI flag > env var > this file > default. judge_budget_usd caps the claude judge's --max-budget-usd (claude backend only; codex/agy/pi have no budget knob). review_timeout_secs bounds every review agent (plan/impl/panel). Env overrides: PLAYBOOK_JUDGE_BUDGET_USD, PLAYBOOK_REVIEW_TIMEOUT_SECS.",
+  "judge_budget_usd": 2,
+  "review_timeout_secs": 300
+}
+CONFIG
+    CREATED+=(".agent/config.json")
+else
+    SKIPPED+=(".agent/config.json (exists)")
+fi
+
 # On Git-Bash/MSYS, python3 is usually native Windows Python, which cannot open
 # MSYS-style paths (/c/Users/...). Convert to a mixed-mode Windows path
 # (C:/Users/...) — forward slashes so it's also safe inside a Python string

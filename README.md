@@ -89,6 +89,22 @@ The sandbox uses macOS seatbelt or Linux bubblewrap. Your project directory is w
 
 Tell the agent what you want built, what constraints matter, and what done looks like. You can steer at any point by chatting - but as the mind map fills in, the agent learns the project's quirks and needs less of it. If you want to follow along, task.md is easier to watch than the chat feed - you see from above, gates checking one by one, outcomes piling up. When it finishes, every decision is recorded and every test result is there.
 
+## Configuration
+
+Per-install review knobs live in `.agent/config.json` (created by `/playbook:init`, hand-editable):
+
+```json
+{
+  "judge_budget_usd": 2,
+  "review_timeout_secs": 300
+}
+```
+
+- `judge_budget_usd` — spend cap for the **claude** judge (`--max-budget-usd`). Claude-only; codex/agy/pi have no budget knob.
+- `review_timeout_secs` — hard timeout for every review agent (plan / impl / panel). On expiry the whole process tree is terminated and the prior review log is left untouched.
+
+Precedence, highest first: **CLI flag** (`--budget`, `--timeout` on `plan-review` / `impl-review` / `panel-review`) → **env var** (`PLAYBOOK_JUDGE_BUDGET_USD`, `PLAYBOOK_REVIEW_TIMEOUT_SECS`) → **`.agent/config.json`** → built-in default. A missing file or malformed value falls back to the default (surfaced by `tasks doctor`, never fatal).
+
 ## Two agents, one task
 
 One setup that works well: the **orchestrator** runs outside the sandbox - writes plans, reviews results, commits. The **sandbox agent** runs in bypass mode - picks up the task.md and builds. The task.md is the handoff. Different agents across different sessions can pick up the same task and keep going from wherever it stopped.

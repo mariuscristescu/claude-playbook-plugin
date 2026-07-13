@@ -1098,7 +1098,8 @@ def main():
         # Parse flags
         review_mode = "plan"
         web_search = False
-        timeout_secs = 300  # 5 min default
+        timeout_secs = None  # --timeout override; else resolved from config below
+        budget_flag = None   # --budget override (claude judges only)
         extra_prompt = ""
         no_mind_map = False
         bare = False
@@ -1117,6 +1118,9 @@ def main():
                 i += 1
             elif cmd_args[i] == "--timeout" and i + 1 < len(cmd_args):
                 timeout_secs = int(cmd_args[i + 1])
+                i += 2
+            elif cmd_args[i] == "--budget" and i + 1 < len(cmd_args):
+                budget_flag = cmd_args[i + 1]
                 i += 2
             elif cmd_args[i] == "--prompt" and i + 1 < len(cmd_args):
                 extra_prompt = cmd_args[i + 1]
@@ -1142,10 +1146,15 @@ def main():
         # Task number is optional; --prompt required when omitted
         if not task_num and not extra_prompt:
             print("Error: 'panel-review' requires a task number or --prompt", file=sys.stderr)
-            print("Usage: tasks panel-review [<number>] [--mode plan|impl] [--models codex:gpt-5.5,agy,...] [--prompt \"...\"] [--no-mind-map] [--bare] [--web-search] [--timeout SECONDS]", file=sys.stderr)
+            print("Usage: tasks panel-review [<number>] [--mode plan|impl] [--models codex:gpt-5.5,agy,...] [--prompt \"...\"] [--no-mind-map] [--bare] [--web-search] [--timeout SECONDS] [--budget USD]", file=sys.stderr)
             sys.exit(1)
 
         project_path = find_project_root()
+        # Review knobs — precedence: --flag > env var > .agent/config.json > default.
+        from tasks.core import resolve_judge_budget, resolve_review_timeout
+        if timeout_secs is None:
+            timeout_secs = resolve_review_timeout(project_path)
+        panel_budget = budget_flag if budget_flag else resolve_judge_budget(project_path)
 
         # Resolve task file if task number given
         task_file = None
@@ -1278,6 +1287,7 @@ def main():
                     system_context=system_context,
                     web_search=web_search,
                     timeout_secs=timeout_secs,
+                    budget_usd=panel_budget,
                 )
                 return label, output
             except subprocess.TimeoutExpired:
@@ -1341,7 +1351,7 @@ def main():
         review_cmd = cmd
         if not cmd_args:
             print(f"Error: '{review_cmd}' requires a task number", file=sys.stderr)
-            print(f"Usage: tasks {review_cmd} <number> [--backend codex|claude|agy|pi] [--model <variant>] [--prompt \"...\"]  (default backend: models.json default_judge, ships codex)", file=sys.stderr)
+            print(f"Usage: tasks {review_cmd} <number> [--backend codex|claude|agy|pi] [--model <variant>] [--prompt \"...\"] [--timeout SECONDS] [--budget USD]  (default backend: models.json default_judge, ships codex; --budget is claude-only)", file=sys.stderr)
             sys.exit(1)
 
         import subprocess
@@ -1350,6 +1360,8 @@ def main():
         backend = None   # explicit --backend; else from models.json default_judge
         model = None     # explicit --model (variant within the backend)
         extra_prompt = ""
+        timeout_flag = None   # --timeout N  (overrides env / config / default)
+        budget_flag = None    # --budget N   (claude only; overrides env / config / default)
         remaining_args = []
         i = 0
         while i < len(cmd_args):
@@ -1361,6 +1373,12 @@ def main():
                 i += 2
             elif cmd_args[i] == "--prompt" and i + 1 < len(cmd_args):
                 extra_prompt = cmd_args[i + 1]
+                i += 2
+            elif cmd_args[i] == "--timeout" and i + 1 < len(cmd_args):
+                timeout_flag = cmd_args[i + 1]
+                i += 2
+            elif cmd_args[i] == "--budget" and i + 1 < len(cmd_args):
+                budget_flag = cmd_args[i + 1]
                 i += 2
             else:
                 remaining_args.append(cmd_args[i])
@@ -1397,6 +1415,11 @@ def main():
         if task_num.isdigit():
             task_num = task_num.zfill(3)
         project_path = find_project_root()
+        # Review knobs — precedence: --flag > env var > .agent/config.json >
+        # built-in default (resolvers live in tasks.core).
+        from tasks.core import resolve_judge_budget, resolve_review_timeout
+        review_timeout = int(timeout_flag) if timeout_flag else resolve_review_timeout(project_path)
+        review_budget = budget_flag if budget_flag else resolve_judge_budget(project_path)
         tasks_dir = resolve_agent_dir(project_path) / "tasks"
         matches = list(tasks_dir.glob(f"{task_num}-*/task.md"))
         if not matches:
@@ -1434,6 +1457,18 @@ def main():
         prompt_fn = plan_review_prompt if review_mode == "plan" else impl_review_prompt
         review_label = "plan review" if review_mode == "plan" else "impl review"
 
+        def _bail_review_timeout():
+            # A timed-out review exits BEFORE the log-save below, so any previous
+            # review log is left untouched (never overwritten with a partial run).
+            print(
+                f"\n{review_label} timed out after {review_timeout}s "
+                "(raise it with --timeout, PLAYBOOK_REVIEW_TIMEOUT_SECS, or "
+                ".agent/config.json review_timeout_secs). Previous review log "
+                "left untouched.",
+                file=sys.stderr, flush=True,
+            )
+            sys.exit(1)
+
         if backend == "claude":
             claude_bin = shutil.which("claude")
             if not claude_bin:
@@ -1453,7 +1488,7 @@ def main():
             # The judge is a read-only evaluator sandboxed via provider.sandbox
             # (write containment via seatbelt/bwrap). PLAYBOOK_SESSION_ID=judge
             # above lets hooks identify judge sessions if needed.
-            claude_args = ["-p", "--max-budget-usd", "2"]
+            claude_args = ["-p", "--max-budget-usd", review_budget]
             if model:
                 from provider.adapters.claude import ClaudeAdapter
                 claude_args += ["--model", ClaudeAdapter._MODEL_MAP.get(model, model)]
@@ -1466,17 +1501,21 @@ def main():
 
             from provider import sandbox as _sandbox
             print(f"Running {review_label} (claude) on {task_path}...", flush=True)
-            result = _sandbox.run(
-                "claude",
-                claude_args,
-                project_root=project_path,
-                env=env,
-                input=full_prompt,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
+            try:
+                result = _sandbox.run(
+                    "claude",
+                    claude_args,
+                    project_root=project_path,
+                    env=env,
+                    input=full_prompt,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=review_timeout,
+                )
+            except subprocess.TimeoutExpired:
+                _bail_review_timeout()
 
         elif backend == "codex":
             if not shutil.which("codex"):
@@ -1511,16 +1550,20 @@ def main():
 
             from provider import sandbox as _sandbox
             print(f"Running {review_label} (codex) on {task_path}...", flush=True)
-            result = _sandbox.run(
-                "codex", codex_args,
-                project_root=project_path,
-                env=codex_env,
-                input=full_prompt,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
+            try:
+                result = _sandbox.run(
+                    "codex", codex_args,
+                    project_root=project_path,
+                    env=codex_env,
+                    input=full_prompt,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=review_timeout,
+                )
+            except subprocess.TimeoutExpired:
+                _bail_review_timeout()
 
         elif backend == "antigravity":  # agy
             if not shutil.which("agy"):
@@ -1544,7 +1587,9 @@ def main():
             agy_args = [
                 "--add-dir", str(project_path),
                 "--print",
-                "--print-timeout", "300s",
+                # agy's own internal wait — keep it in step with the subprocess
+                # timeout so the two limits never disagree.
+                "--print-timeout", f"{review_timeout}s",
             ]
 
             agy_env = os.environ.copy()
@@ -1552,16 +1597,20 @@ def main():
 
             from provider import sandbox as _sandbox
             print(f"Running {review_label} (agy) on {task_path}...", flush=True)
-            result = _sandbox.run(
-                "agy", agy_args,
-                project_root=project_path,
-                env=agy_env,
-                input=full_prompt,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
+            try:
+                result = _sandbox.run(
+                    "agy", agy_args,
+                    project_root=project_path,
+                    env=agy_env,
+                    input=full_prompt,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=review_timeout,
+                )
+            except subprocess.TimeoutExpired:
+                _bail_review_timeout()
 
         else:  # pi (local Qwen via oMLX)
             if not (shutil.which("pi") or shutil.which("omlx")):
@@ -1589,15 +1638,19 @@ def main():
 
             from provider import sandbox as _sandbox
             print(f"Running {review_label} (pi) on {task_path}...", flush=True)
-            result = _sandbox.run(
-                "pi", pi_args,
-                project_root=project_path,
-                env=pi_env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
+            try:
+                result = _sandbox.run(
+                    "pi", pi_args,
+                    project_root=project_path,
+                    env=pi_env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=review_timeout,
+                )
+            except subprocess.TimeoutExpired:
+                _bail_review_timeout()
 
         if result.stdout:
             print(result.stdout, end="", flush=True)
@@ -2320,6 +2373,7 @@ def main():
         project_path = find_project_root()
         passed = 0
         failed = 0
+        warned = 0
 
         def iter_hook_commands(node):
             if isinstance(node, dict):
@@ -2344,6 +2398,15 @@ def main():
             else:
                 failed += 1
 
+        def warn(name: str, detail: str = ""):
+            # Non-fatal advisory: surfaced but never counts as a failed check.
+            nonlocal warned
+            msg = f"  [WARN] {name}"
+            if detail:
+                msg += f" — {detail}"
+            print(msg)
+            warned += 1
+
         print("tasks doctor\n")
 
         # 1. Project structure
@@ -2353,6 +2416,37 @@ def main():
         check("project: CLAUDE.md exists", claude_md.exists())
         mind_map = project_path / "MIND_MAP.md"
         check("project: MIND_MAP.md exists", mind_map.exists())
+
+        # 1b. Optional per-install config (.agent/config.json). Advisory only:
+        # a missing/malformed file or bad value falls back to defaults at runtime,
+        # so these are warnings, not failures.
+        import json as _json
+        cfg_path = project_path / ".agent" / "config.json"
+        if cfg_path.exists():
+            try:
+                _cfg = _json.loads(cfg_path.read_text(encoding="utf-8", errors="replace"))
+            except (ValueError, OSError) as e:
+                warn("config: .agent/config.json parses", f"invalid JSON ({e}); defaults used")
+                _cfg = None
+            if isinstance(_cfg, dict):
+                _jb = _cfg.get("judge_budget_usd")
+                if _jb is not None:
+                    try:
+                        _ok = float(_jb) >= 0
+                    except (TypeError, ValueError):
+                        _ok = False
+                    if not _ok:
+                        warn("config: judge_budget_usd", f"{_jb!r} not a non-negative number; default $2 used")
+                _rt = _cfg.get("review_timeout_secs")
+                if _rt is not None:
+                    try:
+                        _ok = int(_rt) > 0
+                    except (TypeError, ValueError):
+                        _ok = False
+                    if not _ok:
+                        warn("config: review_timeout_secs", f"{_rt!r} not a positive integer; default 300s used")
+            elif _cfg is not None:
+                warn("config: .agent/config.json shape", "top-level value is not a JSON object; ignored")
 
         # 2. Unicode
         stdout_enc = getattr(sys.stdout, "encoding", "unknown") or "unknown"
@@ -2551,11 +2645,12 @@ def main():
 
         # Summary
         total = passed + failed
-        print(f"\n{passed}/{total} checks passed", end="")
+        summary = f"\n{passed}/{total} checks passed"
         if failed:
-            print(f" ({failed} failed)")
-        else:
-            print()
+            summary += f" ({failed} failed)"
+        if warned:
+            summary += f" ({warned} warning{'s' if warned != 1 else ''})"
+        print(summary)
 
     elif cmd == "merge-doctor":
         if not cmd_args:
