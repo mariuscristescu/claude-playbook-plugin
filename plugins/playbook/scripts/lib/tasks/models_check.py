@@ -33,8 +33,9 @@ Verdicts:
   BAD_EFFORT        codex model exists but the :effort suffix isn't supported
   NEEDS_CLI_UPGRADE model needs a newer provider CLI (codex 400 signature)
   UNVERIFIABLE      provider offers no way to check (agy, pi)
+  PROVIDER_MISSING  the pin's provider CLI is not available on this machine
   UNPROBED          claude pin under --no-probe
-  UNKNOWN           provider CLI missing, or probe indeterminate (timeout)
+  UNKNOWN           probe indeterminate (timeout, launch failure, odd error)
 """
 from __future__ import annotations
 
@@ -60,6 +61,7 @@ GONE = "GONE"
 BAD_EFFORT = "BAD_EFFORT"
 NEEDS_CLI_UPGRADE = "NEEDS_CLI_UPGRADE"
 UNVERIFIABLE = "UNVERIFIABLE"
+PROVIDER_MISSING = "PROVIDER_MISSING"
 UNPROBED = "UNPROBED"
 UNKNOWN = "UNKNOWN"
 
@@ -137,15 +139,21 @@ def parse_codex_cache(text: str) -> dict:
     (visibility != "list") are kept — a pin to one still runs.
     """
     raw = json.loads(text)
+    if not isinstance(raw, dict):
+        raise ValueError("models cache is not a JSON object")
     models: dict[str, list[str]] = {}
-    for m in raw.get("models", []):
+    entries = raw.get("models", [])
+    for m in entries if isinstance(entries, list) else []:
+        if not isinstance(m, dict):
+            continue
         slug = m.get("slug")
         if not isinstance(slug, str) or not slug:
             continue
+        levels = m.get("supported_reasoning_levels", [])
         efforts = [
             lvl.get("effort")
-            for lvl in m.get("supported_reasoning_levels", [])
-            if isinstance(lvl.get("effort"), str)
+            for lvl in (levels if isinstance(levels, list) else [])
+            if isinstance(lvl, dict) and isinstance(lvl.get("effort"), str)
         ]
         models[slug] = efforts
     return {
@@ -193,18 +201,25 @@ def _version_tuple(v: str) -> tuple[int, ...]:
     return tuple(int(p) for p in v.split("."))
 
 
-def probe_codex_model(model: str, timeout: int = PROBE_TIMEOUT_SECS) -> tuple[str, str]:
+def probe_codex_model(model: str, effort: Optional[str] = None,
+                      timeout: int = PROBE_TIMEOUT_SECS) -> tuple[str, str]:
     """Live-probe one codex model id → (verdict, detail).
 
     The cache is a catalog, not an entitlement list (a listed model can 400
     per-account), so GONE/NEEDS_CLI_UPGRADE come only from the live 400
-    signatures; timeouts and unrecognized failures are UNKNOWN.
+    signatures; timeouts and unrecognized failures are UNKNOWN. When the pin
+    carries an :effort suffix, the probe sends the same
+    `-c model_reasoning_effort=` the judge path sends (codex.py), so an
+    effort the model doesn't accept fails here instead of at review time.
     """
+    argv = ["codex", "exec", "-m", model, "--skip-git-repo-check"]
+    if effort:
+        argv += ["-c", f"model_reasoning_effort={effort}"]
+    argv.append("reply with exactly: ok")
     with tempfile.TemporaryDirectory(prefix="playbook-models-probe-") as td:
         try:
             result = subprocess.run(
-                ["codex", "exec", "-m", model, "--skip-git-repo-check",
-                 "reply with exactly: ok"],
+                argv,
                 cwd=td, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                 timeout=timeout, encoding="utf-8", errors="replace",
             )
@@ -325,11 +340,14 @@ def check_pins(project_root: Path, probe: bool = True,
     from provider.adapters.codex import _split_reasoning_effort
     from provider.sandbox import load_judge_config, resolve_judge_spec
 
-    cfg = load_judge_config()
+    cfg = load_judge_config(project_root)
     panel = list(cfg.get("panel") or [])
     default_judge = cfg.get("default_judge")
     specs = list(panel)
-    for s in ([default_judge] if default_judge else []) + list(extra_specs or []):
+    # User-supplied claude candidates get probed verdict rows like any pin —
+    # this is the only way a NEW claude model id enters the report (I7).
+    candidate_specs = [f"claude:{cid}" for cid in (claude_candidates or [])]
+    for s in ([default_judge] if default_judge else []) + list(extra_specs or []) + candidate_specs:
         if s and s not in specs:
             specs.append(s)
 
@@ -360,11 +378,13 @@ def check_pins(project_root: Path, probe: bool = True,
 
     probed: dict[tuple[str, str], tuple[str, str]] = {}
 
-    def _probe(provider: str, model: str) -> tuple[str, str]:
-        key = (provider, model)
+    def _probe(provider: str, model: str, effort: Optional[str] = None) -> tuple[str, str]:
+        key = (provider, model, effort)
         if key not in probed:
-            fn = probe_claude_model if provider == "claude" else probe_codex_model
-            probed[key] = fn(model)
+            if provider == "claude":
+                probed[key] = probe_claude_model(model)
+            else:
+                probed[key] = probe_codex_model(model, effort=effort)
         return probed[key]
 
     entries = []
@@ -380,10 +400,15 @@ def check_pins(project_root: Path, probe: bool = True,
             entries.append({"spec": spec, "provider": "?", "variant": None,
                             "verdict": GONE, "detail": str(e)})
             continue
-        adapter = adapters[provider]
+        adapter = adapters.get(provider)
+        if adapter is None:
+            entries.append({"spec": spec, "provider": provider, "variant": variant,
+                            "verdict": GONE,
+                            "detail": f"unknown provider '{provider}' (bad alias?)"})
+            continue
         if not adapter.is_available():
             entries.append({"spec": spec, "provider": provider, "variant": variant,
-                            "verdict": UNKNOWN,
+                            "verdict": PROVIDER_MISSING,
                             "detail": f"provider '{provider}' not available on this machine"})
             continue
 
@@ -402,7 +427,7 @@ def check_pins(project_root: Path, probe: bool = True,
                     verdict = BAD_EFFORT
                     detail = f"'{model_id}' supports efforts {', '.join(efforts)} — not '{effort}'"
                 elif probe:
-                    verdict, detail = _probe("codex", model_id)
+                    verdict, detail = _probe("codex", model_id, effort)
                 elif codex_cache is None:
                     verdict, detail = UNVERIFIABLE, "no ~/.codex/models_cache.json to check against"
                 elif efforts is None:
@@ -462,7 +487,60 @@ def render_report(report: dict) -> str:
 def bad_pins(report: dict) -> list[dict]:
     """Entries whose verdict means the judge cannot run as pinned."""
     return [e for e in report["entries"]
-            if e["verdict"] in (GONE, BAD_EFFORT, NEEDS_CLI_UPGRADE)]
+            if e["verdict"] in (GONE, BAD_EFFORT, NEEDS_CLI_UPGRADE, PROVIDER_MISSING)]
+
+
+def confirm_dead_specs(failed_outputs: dict, spec_providers: dict, *,
+                       probe_claude=None, probe_codex=None) -> dict:
+    """Probe-confirm which FAILED judge specs are actually dead.
+
+    The shared hard-stop gate for panel and single-judge reviews:
+    classification of the failure string is only a hint (failure tails can
+    echo prompt fragments containing the very signatures we match); a live
+    probe of the exact spec is the evidence that justifies exit 1.
+
+    failed_outputs: {spec_label: output_text} for failed judges only.
+    spec_providers: {spec_label: (provider, variant_or_None)}.
+    Probes are injectable for tests. Returns {spec_label: (verdict, detail)}
+    holding only probe-confirmed GONE / NEEDS_CLI_UPGRADE specs — agy/pi,
+    variantless pins, and local effort-spec errors are unconfirmable and
+    skipped (they keep today's soft-fail).
+    """
+    from provider.adapters.codex import _split_reasoning_effort
+    probe_claude = probe_claude or probe_claude_model
+    probe_codex = probe_codex or probe_codex_model
+    confirmed: dict = {}
+    for spec in sorted(failed_outputs):
+        if classify_failure(failed_outputs[spec]) not in (
+                MODEL_UNAVAILABLE, CLI_UPGRADE_REQUIRED):
+            continue
+        provider, variant = spec_providers.get(spec, (None, None))
+        if provider == "claude" and variant:
+            pv, detail = probe_claude(variant)
+        elif provider == "codex" and variant:
+            try:
+                model_id, effort = _split_reasoning_effort(variant)
+            except ValueError:
+                continue  # local spec error, not availability
+            pv, detail = probe_codex(model_id, effort=effort)
+        else:
+            continue
+        if pv in (GONE, NEEDS_CLI_UPGRADE):
+            confirmed[spec] = (pv, detail)
+    return confirmed
+
+
+def apply_confirmed(report: dict, confirmed: dict) -> dict:
+    """Override report entries with probe-confirmed verdicts.
+
+    The hard-stop report is built with probe=False for speed; without this,
+    a pin just probe-confirmed GONE (per-account 400) could still render
+    LISTED from the cache in the very same output — a self-contradiction.
+    """
+    for e in report["entries"]:
+        if e["spec"] in confirmed:
+            e["verdict"], e["detail"] = confirmed[e["spec"]]
+    return report
 
 
 # ── select ───────────────────────────────────────────────────────────────────
@@ -493,7 +571,7 @@ def run_select(project_root: Path, probe: bool = True,
     # Fallback = the effective (shipped) panel, NOT report entries — the
     # report also lists default_judge and extra specs, which aren't pins.
     from provider.sandbox import load_judge_config
-    current_panel = existing.get("panel") or list(load_judge_config().get("panel") or [])
+    current_panel = existing.get("panel") or list(load_judge_config(project_root).get("panel") or [])
 
     print("\nCurrent panel:")
     for i, spec in enumerate(current_panel, 1):
@@ -508,15 +586,31 @@ def run_select(project_root: Path, probe: bool = True,
         raw = ""
     new_panel = [s.strip() for s in raw.split(",") if s.strip()] if raw else current_panel
 
+    from provider.adapters.codex import _split_reasoning_effort
     from provider.sandbox import resolve_judge_spec
-    for spec in new_panel:
+
+    def _spec_error(spec: str) -> Optional[str]:
+        """Syntactic validation shared by panel entries and default_judge:
+        empty variants and codex effort suffixes are checked here because
+        resolve_judge_spec accepts both (`codex:` → default model,
+        `codex:gpt-5.5:bogus` → effort unvalidated until review time)."""
         if spec.endswith(":"):
-            print(f"Error: pin '{spec}' has an empty variant", file=sys.stderr)
-            return 1
+            return f"pin '{spec}' has an empty variant"
         try:
-            resolve_judge_spec(spec)
+            provider, variant = resolve_judge_spec(spec)
         except ValueError as e:
-            print(f"Error: {e}", file=sys.stderr)
+            return str(e)
+        if provider == "codex" and variant:
+            try:
+                _split_reasoning_effort(variant)
+            except ValueError as e:
+                return str(e)
+        return None
+
+    for spec in new_panel:
+        err = _spec_error(spec)
+        if err:
+            print(f"Error: {err}", file=sys.stderr)
             return 1
 
     default_judge = existing.get("default_judge")
@@ -525,12 +619,29 @@ def run_select(project_root: Path, probe: bool = True,
     except EOFError:
         dj_raw = ""
     if dj_raw:
-        try:
-            resolve_judge_spec(dj_raw)
-        except ValueError as e:
-            print(f"Error: {e}", file=sys.stderr)
+        err = _spec_error(dj_raw)
+        if err:
+            print(f"Error: {err}", file=sys.stderr)
             return 1
         default_judge = dj_raw
+
+    # Audit the PROPOSED pins (cheap checks) before writing — otherwise select
+    # can immediately re-create a rotten panel (impl-panel I8). Bad verdicts
+    # need an explicit confirmation.
+    proposed = list(new_panel) + ([default_judge] if default_judge else [])
+    audit = check_pins(project_root, probe=False, extra_specs=proposed)
+    bad = [e for e in bad_pins(audit) if e["spec"] in proposed]
+    if bad:
+        print("\nProposed pin(s) look unusable:", file=sys.stderr)
+        for e in bad:
+            print(f"  {e['spec']}: {e['verdict']} — {e['detail']}", file=sys.stderr)
+        try:
+            answer = input("Write anyway? [y/N]> ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer != "y":
+            print("Aborted — nothing written.", file=sys.stderr)
+            return 1
 
     existing["panel"] = new_panel
     if default_judge:
@@ -543,7 +654,9 @@ def run_select(project_root: Path, probe: bool = True,
         "audit with `tasks models check`.",
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    tmp = path.with_suffix(f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)  # atomic — an interrupt can't truncate models.json
     print(f"Wrote {path}")
     return 0
 

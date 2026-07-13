@@ -1315,6 +1315,14 @@ def main():
         print("=== PENDING TASKS ===")
         list_tasks(project_path, pending_only=True)
 
+        # Judge-pin nudge (task 012): covers projects that predate the models
+        # maintenance loop. Presence check only — no probes at session start.
+        if not (project_path / ".agent" / "models.json").exists():
+            print()
+            print("NOTE: no .agent/models.json — judge panel uses the plugin's shipped")
+            print("defaults, which drift as providers retire models. Relay to the user:")
+            print("pin per-machine judges via `tasks models check` + `tasks models select`.")
+
         # CLI reference — shown last so mind map + tasks aren't buried
         from tasks.template import cli_reference
         print()
@@ -1591,44 +1599,29 @@ def main():
         # written above, so the review is never lost. Timeout/budget/other
         # failures keep the soft behavior (exit 0 fall-through).
         if failed:
-            from provider.adapters.codex import _split_reasoning_effort
             from tasks.models_check import (
-                CLI_UPGRADE_REQUIRED, GONE, MODEL_UNAVAILABLE, NEEDS_CLI_UPGRADE,
-                check_pins, classify_failure, probe_claude_model,
-                probe_codex_model, render_report,
+                NEEDS_CLI_UPGRADE, apply_confirmed, check_pins,
+                confirm_dead_specs, render_report,
             )
             label_provider = {}
             for adapter_cls, variant in judges:
                 provider_name = adapter_cls.binary_name()
                 lbl = f"{provider_name}:{variant}" if variant else provider_name
                 label_provider[lbl] = (provider_name, variant)
-            confirmed_dead = []
-            for lbl in sorted(failed):
-                if classify_failure(results[lbl]) not in (MODEL_UNAVAILABLE, CLI_UPGRADE_REQUIRED):
-                    continue
-                provider_name, variant = label_provider.get(lbl, (None, None))
-                if provider_name == "claude" and variant:
-                    pv, detail = probe_claude_model(variant)
-                elif provider_name == "codex" and variant:
-                    try:
-                        model_id, _effort = _split_reasoning_effort(variant)
-                    except ValueError:
-                        continue  # local spec error, not availability
-                    pv, detail = probe_codex_model(model_id)
-                else:
-                    continue  # agy/pi or variantless: unconfirmable → soft-fail
-                if pv in (GONE, NEEDS_CLI_UPGRADE):
-                    confirmed_dead.append((lbl, pv, detail))
-            if confirmed_dead:
+            confirmed = confirm_dead_specs(
+                {lbl: results[lbl] for lbl in failed}, label_provider)
+            if confirmed:
                 print("\nHARD STOP: judge pin(s) unavailable (probe-confirmed):", file=sys.stderr)
-                for lbl, pv, detail in confirmed_dead:
+                for lbl in sorted(confirmed):
+                    pv, detail = confirmed[lbl]
                     fix = ("upgrade the codex CLI (`codex update`)"
                            if pv == NEEDS_CLI_UPGRADE
                            else "re-select the panel (`tasks models select`)")
                     print(f"  {lbl}: {pv} — {detail} → {fix}", file=sys.stderr)
                 print("\nCurrent availability:", file=sys.stderr)
-                report = check_pins(project_path, probe=False,
-                                    extra_specs=[lbl for lbl, _pv, _d in confirmed_dead])
+                report = apply_confirmed(
+                    check_pins(project_path, probe=False, extra_specs=sorted(confirmed)),
+                    confirmed)
                 print(render_report(report), file=sys.stderr)
                 print("\nReview saved to judge.md but the panel is degraded — "
                       "decide how to proceed before re-running.", file=sys.stderr)
@@ -1978,6 +1971,7 @@ def main():
         # BEFORE saving so it never overwrites a prior good review, tell the
         # user how to raise the cap, and exit nonzero — it's not a review.
         from tasks.models_check import budget_exceeded as _budget_exceeded
+        from tasks.models_check import judge_failed as _judge_failed_str
         if _budget_exceeded(output):
             kept = (f"; kept previous {judge_log.relative_to(project_path)}"
                     if judge_log.exists() else "")
@@ -1985,7 +1979,12 @@ def main():
                   f"review{kept}. Raise judge_budget_usd in .agent/config.json "
                   f"or pass --budget.", flush=True)
             sys.exit(1)
-        if result.returncode != 0 and not output:
+        # Failure-marked output (e.g. claude's bad-model message: stdout WITH
+        # exit 1) is not a review either — never let it overwrite a prior good
+        # log (task 012 I1). The formatted string is what classification below
+        # sees, so save/keep and hard-stop agree on what counts as a failure.
+        _formatted_result = _sandbox.format_judge_output(result)
+        if result.returncode != 0 and (not output or _judge_failed_str(_formatted_result)):
             if judge_log.exists():
                 print(f"\nReview failed (exit {result.returncode}); kept previous {judge_log.relative_to(project_path)}", flush=True)
             else:
@@ -2004,33 +2003,26 @@ def main():
         # then probe-confirm the exact spec before hard-stopping. Timeout
         # (handled above via _bail_review_timeout) and budget paths untouched.
         from tasks.models_check import (
-            CLI_UPGRADE_REQUIRED, GONE, MODEL_UNAVAILABLE, NEEDS_CLI_UPGRADE,
-            check_pins, classify_failure, probe_claude_model, probe_codex_model,
+            NEEDS_CLI_UPGRADE, apply_confirmed, check_pins, confirm_dead_specs,
             render_report,
         )
-        if classify_failure(_sandbox.format_judge_output(result)) in (
-                MODEL_UNAVAILABLE, CLI_UPGRADE_REQUIRED):
-            pv = detail = None
-            if backend == "claude" and model:
-                pv, detail = probe_claude_model(model)
-            elif backend == "codex" and model:
-                from provider.adapters.codex import _split_reasoning_effort
-                try:
-                    model_id, _effort = _split_reasoning_effort(model)
-                    pv, detail = probe_codex_model(model_id)
-                except ValueError:
-                    pass  # local spec error, not availability
-            if pv in (GONE, NEEDS_CLI_UPGRADE):
-                spec = f"{'agy' if backend == 'antigravity' else backend}:{model}"
-                fix = ("upgrade the codex CLI (`codex update`)"
-                       if pv == NEEDS_CLI_UPGRADE
-                       else "re-select the panel (`tasks models select`)")
-                print(f"\nHARD STOP: judge pin unavailable (probe-confirmed):\n"
-                      f"  {spec}: {pv} — {detail} → {fix}\n\nCurrent availability:",
-                      file=sys.stderr)
-                print(render_report(check_pins(project_path, probe=False,
-                                               extra_specs=[spec])), file=sys.stderr)
-                sys.exit(1)
+        _sj_provider = "agy" if backend == "antigravity" else backend
+        _sj_spec = f"{_sj_provider}:{model}" if model else _sj_provider
+        confirmed = confirm_dead_specs(
+            {_sj_spec: _formatted_result}, {_sj_spec: (_sj_provider, model)})
+        if confirmed:
+            pv, detail = confirmed[_sj_spec]
+            fix = ("upgrade the codex CLI (`codex update`)"
+                   if pv == NEEDS_CLI_UPGRADE
+                   else "re-select the panel (`tasks models select`)")
+            print(f"\nHARD STOP: judge pin unavailable (probe-confirmed):\n"
+                  f"  {_sj_spec}: {pv} — {detail} → {fix}\n\nCurrent availability:",
+                  file=sys.stderr)
+            report = apply_confirmed(
+                check_pins(project_path, probe=False, extra_specs=[_sj_spec]),
+                confirmed)
+            print(render_report(report), file=sys.stderr)
+            sys.exit(1)
 
         sys.exit(result.returncode)
 

@@ -98,6 +98,16 @@ class FormatJudgeOutputTest(unittest.TestCase):
         out = sandbox.format_judge_output(_CP([], 1, stdout="", stderr=noisy))
         self.assertIn("model is not supported", out)
 
+    def test_signature_before_truncation_point_survives(self):
+        # D3: signature followed by 5000 chars of trailing noise would be cut
+        # by the 2000-char tail — the [signature] line must rescue it, and the
+        # classifier must still fire.
+        noisy = _CODEX_GONE_STDERR + "\n" + ("y" * 5000)
+        out = sandbox.format_judge_output(_CP([], 1, stdout="", stderr=noisy))
+        self.assertIn("[signature]", out)
+        self.assertIn("model is not supported", out)
+        self.assertEqual(mc.classify_failure(out), mc.MODEL_UNAVAILABLE)
+
 
 class ClassifyFailureTest(unittest.TestCase):
     """B1: corpus classification over post-format strings, R2 guards."""
@@ -182,7 +192,7 @@ class CheckPinsTest(unittest.TestCase):
                               side_effect=lambda m, timeout=0: (mc.OK, "responds")
                               if m == "claude-fable-5" else (mc.GONE, "claude rejects this model id")),
             mock.patch.object(mc, "probe_codex_model",
-                              side_effect=lambda m, timeout=0: (mc.OK, "responds")
+                              side_effect=lambda m, effort=None, timeout=0: (mc.OK, "responds")
                               if m in ("gpt-5.6-sol", "gpt-5.5") else (mc.GONE, "rejected")),
             mock.patch("provider.sandbox.load_judge_config", return_value={
                 "default_judge": "claude",
@@ -236,6 +246,159 @@ class CheckPinsTest(unittest.TestCase):
             report = mc.check_pins(self.project, probe=False)
         self.assertTrue(any("older than the cache writer" in w for w in report["warnings"]))
 
+    def test_claude_candidates_get_probed_verdicts(self):
+        # D4/I7: user-supplied candidates become real probed entries.
+        report = mc.check_pins(self.project, probe=True,
+                               claude_candidates=["claude-fable-5", "claude-dead-1"])
+        v = self._verdicts(report)
+        self.assertEqual(v.get("claude:claude-dead-1"), mc.GONE)
+
+    def test_provider_missing_is_a_bad_pin(self):
+        # D6/I10: a pin whose provider CLI is absent can't run here — check
+        # must exit nonzero, so it counts as bad.
+        unavail = mock.MagicMock()
+        unavail.is_available.return_value = False
+        avail = mock.MagicMock()
+        avail.is_available.return_value = True
+        with mock.patch.object(mc, "_adapter_classes", return_value={
+                "claude": avail, "codex": avail, "agy": avail, "pi": unavail}), \
+             mock.patch("provider.sandbox.load_judge_config",
+                        return_value={"default_judge": None, "panel": ["pi"]}):
+            report = mc.check_pins(self.project, probe=False)
+        self.assertEqual(self._verdicts(report)["pi"], mc.PROVIDER_MISSING)
+        self.assertEqual([e["spec"] for e in mc.bad_pins(report)], ["pi"])
+
+    def test_unknown_alias_provider_is_bad_pin_not_crash(self):
+        # D6/I9: a hand-authored alias with an unknown provider must yield an
+        # actionable entry, not a KeyError.
+        with mock.patch("provider.sandbox.resolve_judge_spec",
+                        return_value=("mystery", "m-1")), \
+             mock.patch("provider.sandbox.load_judge_config",
+                        return_value={"default_judge": None, "panel": ["mystery:m-1"]}):
+            report = mc.check_pins(self.project, probe=False)
+        e = report["entries"][0]
+        self.assertEqual(e["verdict"], mc.GONE)
+        self.assertIn("unknown provider", e["detail"])
+
+    def test_malformed_cache_entries_tolerated(self):
+        # D6/I11: null entries / wrong shapes must not crash the parser.
+        parsed = mc.parse_codex_cache(json.dumps(
+            {"models": [None, {"slug": "ok-model", "supported_reasoning_levels": None},
+                        {"no_slug": True}, {"slug": "x", "supported_reasoning_levels": [None]}]}))
+        self.assertEqual(parsed["models"], {"ok-model": [], "x": []})
+        with self.assertRaises(ValueError):
+            mc.parse_codex_cache("[1,2,3]")
+
+
+class ProbeArgvTest(unittest.TestCase):
+    def test_codex_probe_argv_carries_effort(self):
+        # D4/I16: the probe must send the same model_reasoning_effort the
+        # judge path sends, so an unsupported effort fails at check time.
+        captured = {}
+
+        def fake_run(argv, **kw):
+            captured["argv"] = argv
+            return _CP(argv, 0, stdout="ok", stderr="")
+
+        with mock.patch.object(mc.subprocess, "run", side_effect=fake_run):
+            verdict, _ = mc.probe_codex_model("gpt-5.5", effort="xhigh")
+        self.assertEqual(verdict, mc.OK)
+        self.assertIn("-c", captured["argv"])
+        self.assertIn("model_reasoning_effort=xhigh", captured["argv"])
+
+    def test_codex_probe_argv_no_effort_flag_when_absent(self):
+        captured = {}
+
+        def fake_run(argv, **kw):
+            captured["argv"] = argv
+            return _CP(argv, 0, stdout="ok", stderr="")
+
+        with mock.patch.object(mc.subprocess, "run", side_effect=fake_run):
+            mc.probe_codex_model("gpt-5.5")
+        self.assertNotIn("-c", captured["argv"])
+
+
+class ConfirmDeadSpecsTest(unittest.TestCase):
+    """D2: the hard-stop gate — classification is a hint, the probe decides."""
+
+    def setUp(self):
+        self.codex_gone = sandbox.format_judge_output(
+            _CP([], 1, stdout="", stderr=_CODEX_GONE_STDERR))
+        self.codex_old = sandbox.format_judge_output(
+            _CP([], 1, stdout="", stderr=_CODEX_CLI_OLD_STDERR))
+        self.claude_gone = sandbox.format_judge_output(
+            _CP([], 1, stdout=_CLAUDE_GONE_STDOUT, stderr=""))
+        self.probe_calls = []
+
+    def _probe(self, verdict, detail="probed"):
+        def fn(m, effort=None, timeout=0):
+            self.probe_calls.append(m)
+            return verdict, detail
+        return fn
+
+    def test_model_gone_probe_confirms(self):
+        confirmed = mc.confirm_dead_specs(
+            {"codex:gpt-5.3-codex": self.codex_gone},
+            {"codex:gpt-5.3-codex": ("codex", "gpt-5.3-codex")},
+            probe_codex=self._probe(mc.GONE))
+        self.assertEqual(confirmed["codex:gpt-5.3-codex"][0], mc.GONE)
+        self.assertEqual(self.probe_calls, ["gpt-5.3-codex"])
+
+    def test_classified_but_probe_ok_not_confirmed(self):
+        confirmed = mc.confirm_dead_specs(
+            {"codex:gpt-5.5": self.codex_gone},
+            {"codex:gpt-5.5": ("codex", "gpt-5.5")},
+            probe_codex=self._probe(mc.OK, "responds"))
+        self.assertEqual(confirmed, {})
+
+    def test_probe_unknown_not_confirmed(self):
+        confirmed = mc.confirm_dead_specs(
+            {"claude:claude-x": self.claude_gone},
+            {"claude:claude-x": ("claude", "claude-x")},
+            probe_claude=self._probe(mc.UNKNOWN, "probe timed out"))
+        self.assertEqual(confirmed, {})
+
+    def test_timeout_and_budget_never_probe(self):
+        confirmed = mc.confirm_dead_specs(
+            {"claude:claude-fable-5": "(timed out after 300s)",
+             "claude:claude-sonnet-5": "Error: Exceeded USD budget (5)"},
+            {"claude:claude-fable-5": ("claude", "claude-fable-5"),
+             "claude:claude-sonnet-5": ("claude", "claude-sonnet-5")},
+            probe_claude=self._probe(mc.GONE))
+        self.assertEqual(confirmed, {})
+        self.assertEqual(self.probe_calls, [])
+
+    def test_agy_and_variantless_skipped(self):
+        confirmed = mc.confirm_dead_specs(
+            {"agy": self.claude_gone, "codex": self.codex_gone},
+            {"agy": ("agy", None), "codex": ("codex", None)},
+            probe_claude=self._probe(mc.GONE), probe_codex=self._probe(mc.GONE))
+        self.assertEqual(confirmed, {})
+        self.assertEqual(self.probe_calls, [])
+
+    def test_bad_effort_spec_skipped(self):
+        confirmed = mc.confirm_dead_specs(
+            {"codex:gpt-5.5:nope": self.codex_gone},
+            {"codex:gpt-5.5:nope": ("codex", "gpt-5.5:nope")},
+            probe_codex=self._probe(mc.GONE))
+        self.assertEqual(confirmed, {})
+
+    def test_cli_upgrade_confirmed_with_its_verdict(self):
+        confirmed = mc.confirm_dead_specs(
+            {"codex:gpt-5.6-luna:medium": self.codex_old},
+            {"codex:gpt-5.6-luna:medium": ("codex", "gpt-5.6-luna:medium")},
+            probe_codex=self._probe(mc.NEEDS_CLI_UPGRADE, "needs newer CLI"))
+        self.assertEqual(confirmed["codex:gpt-5.6-luna:medium"][0], mc.NEEDS_CLI_UPGRADE)
+        self.assertEqual(self.probe_calls, ["gpt-5.6-luna"])  # effort stripped
+
+    def test_apply_confirmed_overrides_report(self):
+        report = {"entries": [
+            {"spec": "codex:gpt-5.3-codex", "verdict": mc.LISTED, "detail": "in cache"},
+            {"spec": "agy", "verdict": mc.UNVERIFIABLE, "detail": "ui"}]}
+        mc.apply_confirmed(report, {"codex:gpt-5.3-codex": (mc.GONE, "rejected")})
+        self.assertEqual(report["entries"][0]["verdict"], mc.GONE)
+        self.assertEqual(report["entries"][1]["verdict"], mc.UNVERIFIABLE)
+
 
 class SelectTest(unittest.TestCase):
     """A3: fresh-install create + custom-key preservation (R12)."""
@@ -288,6 +451,27 @@ class SelectTest(unittest.TestCase):
     def test_rejects_empty_variant_and_unknown_spec(self):
         self.assertEqual(self._run(["codex:, agy", ""]), 1)
         self.assertEqual(self._run(["not-a-provider:x", ""]), 1)
+
+    def test_rejects_bad_codex_effort_and_empty_variant_default_judge(self):
+        # D5/I8: resolve_judge_spec alone accepts both of these.
+        self.assertEqual(self._run(["codex:gpt-5.5:bogus", ""]), 1)
+        self.assertEqual(self._run(["agy", "codex:"]), 1)
+
+    def test_dead_proposed_pin_requires_confirmation(self):
+        # D5: audit of the PROPOSED panel — 'n' aborts without writing.
+        gone_entry = {"spec": "codex:gpt-5.3-codex", "provider": "codex",
+                      "variant": "gpt-5.3-codex", "verdict": mc.GONE, "detail": "dead"}
+        self._patches[0].stop()
+        self._patches[0] = mock.patch.object(mc, "check_pins", return_value={
+            "entries": [gone_entry], "codex": None, "codex_cli_version": None,
+            "agy_models": None, "claude_candidates": [], "warnings": []})
+        self._patches[0].start()
+        rc = self._run(["codex:gpt-5.3-codex", "", "n"])
+        self.assertEqual(rc, 1)
+        self.assertFalse((self.project / ".agent" / "models.json").exists())
+        rc = self._run(["codex:gpt-5.3-codex", "", "y"])
+        self.assertEqual(rc, 0)
+        self.assertTrue((self.project / ".agent" / "models.json").exists())
 
 
 if __name__ == "__main__":

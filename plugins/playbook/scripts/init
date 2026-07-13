@@ -68,6 +68,15 @@ else
     SKIPPED+=(".agent/config.json (exists)")
 fi
 
+# --- (a4) .agent/models.json — judge pins pointer (task 012) ---
+# NOT auto-created: judge selection is the user's call, and pins are
+# machine-specific (the file is gitignored). Point at the maintenance loop.
+if [ ! -f "$PROJECT_DIR/.agent/models.json" ]; then
+    echo "note: no .agent/models.json — judge panel uses the plugin's shipped defaults."
+    echo "      Pin per-machine judges with: tasks models check   (live availability audit)"
+    echo "                                   tasks models select  (writes .agent/models.json)"
+fi
+
 # On Git-Bash/MSYS, python3 is usually native Windows Python, which cannot open
 # MSYS-style paths (/c/Users/...). Convert to a mixed-mode Windows path
 # (C:/Users/...) — forward slashes so it's also safe inside a Python string
