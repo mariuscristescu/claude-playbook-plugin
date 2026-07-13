@@ -236,20 +236,35 @@ def resolve_judge_spec(name: str) -> tuple[str, str | None]:
 
 def format_judge_output(result: subprocess.CompletedProcess) -> str:
     """Render a judge subprocess result so a failure can never masquerade as a
-    clean empty review (the T139 `(no output)` bug).
+    clean empty review (the T139 `(no output)` bug) — or as a SUCCESSFUL one.
 
-    - non-empty stdout → returned verbatim (the review).
-    - empty stdout + non-zero exit → `(FAILED — exit N)` + stderr tail, so the
-      cause (nested-sandbox rc 71, auth, crash) shows up in judge.md.
-    - empty stdout + exit 0 → genuinely empty (`(no output)`).
+    Returncode wins over stdout (task 012): a CLI that exits nonzero after
+    printing progress — or that prints its error to stdout, as claude does
+    with budget-exceeded and bad-model messages — previously had its stdout
+    returned verbatim and read as a clean review. Failure classification
+    (`classify_failure`) runs only over `(FAILED …)`-marked strings, so both
+    streams must survive here.
+
+    - exit != 0 → `(FAILED — exit N)` + labeled stdout/stderr tails (2000
+      chars each), so the cause AND any model-unavailable signature reach
+      judge.md and the classifier.
+    - exit 0 + non-empty stdout → returned verbatim (the review).
+    - exit 0 + empty stdout → genuinely empty (`(no output)`).
     """
-    if result.stdout and result.stdout.strip():
-        return result.stdout
     rc = result.returncode
+    stdout = (result.stdout or "").strip()
     stderr = (result.stderr or "").strip()
     if rc != 0:
-        tail = stderr[-800:] if stderr else "(no stderr captured)"
-        return f"(FAILED — exit {rc})\n{tail}"
+        parts = [f"(FAILED — exit {rc})"]
+        if stdout:
+            parts.append(f"[stdout tail]\n{stdout[-2000:]}")
+        if stderr:
+            parts.append(f"[stderr tail]\n{stderr[-2000:]}")
+        if not stdout and not stderr:
+            parts.append("(no output captured)")
+        return "\n".join(parts)
+    if stdout:
+        return result.stdout
     return "(no output)"
 
 

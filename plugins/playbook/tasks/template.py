@@ -482,6 +482,8 @@ Tasks CLI:
     tasks plan-review <N>      blind plan review
     tasks impl-review <N>      blind impl review
     tasks panel-review [<N>]   multi-model judge panel; task optional — use --prompt alone for any question, --bare to strip all context
+    tasks models check         audit models.json judge pins against live availability (--no-probe skips claude probes)
+    tasks models select        interactively refresh the panel in .agent/models.json
   Analysis:
     tasks retro [--since N]    project retrospective
     tasks global-retro-collect --since DATE ROOT [ROOT...]   collect cross-VM retro archive
@@ -632,6 +634,8 @@ Commands:
                       --prompt "..."     add steering (appended to review prompt, or full mission if no task)
                       --no-mind-map      strip mind map from context
                       --bare             no context at all; --prompt is the entire prompt
+  models check        Audit models.json judge pins against live availability (--no-probe: skip claude probes)
+  models select       Interactively refresh the panel in .agent/models.json
   retro [--since N]   Project retrospective
   global-retro-collect --since DATE [--machine NAME] [--out DIR] [--format zip|tgz] ROOT [ROOT...]
                       Collect Playbook artifacts for a global retro archive

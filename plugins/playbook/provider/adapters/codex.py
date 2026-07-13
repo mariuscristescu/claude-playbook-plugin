@@ -40,7 +40,10 @@ _AGENTS_MD_LENGTH_THRESHOLD = 2000
 _AGENTS_MD_PREFIXES = ("# AGENTS", "You are ", "# Playbook")
 
 # Accepted values for Codex's `model_reasoning_effort` config key.
-_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
+# Union of levels observed in ~/.codex/models_cache.json supported_reasoning_levels
+# (gpt-5.6 family adds xhigh/max/ultra); per-model validity is the CLI's problem,
+# ours is only to not reject levels that exist.
+_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
 
 
 def _split_reasoning_effort(model: str) -> tuple[str, Optional[str]]:
