@@ -172,6 +172,66 @@ class ParserTest(unittest.TestCase):
                          ["Gemini 3.5 Flash (High)", "Gemini 3.1 Pro (Low)"])
 
 
+class ClaudeConfiguredModelsTest(unittest.TestCase):
+    """task 015: claude has no list command, so discovery reads the live signal —
+    the model the user's Claude Code is configured to run (settings.json)."""
+
+    def _write(self, d: Path, model):
+        (d / ".claude").mkdir(parents=True, exist_ok=True)
+        (d / ".claude" / "settings.json").write_text(
+            json.dumps({} if model is None else {"model": model}), encoding="utf-8")
+
+    def test_project_settings_exact_and_bare(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(mc.Path, "home", return_value=Path(td) / "nohome"):
+            proj = Path(td) / "proj"
+            self._write(proj, "claude-fable-5[1m]")
+            got = mc._claude_configured_models(proj)
+        self.assertEqual(got, ["claude-fable-5[1m]", "claude-fable-5"])
+
+    def test_bare_id_no_duplicate(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(mc.Path, "home", return_value=Path(td) / "nohome"):
+            proj = Path(td) / "proj"
+            self._write(proj, "claude-opus-4-8")
+            self.assertEqual(mc._claude_configured_models(proj), ["claude-opus-4-8"])
+
+    def test_alias_word_skipped(self):
+        # "sonnet"/"default" are not claude-* full ids — baseline covers those
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(mc.Path, "home", return_value=Path(td) / "nohome"):
+            proj = Path(td) / "proj"
+            self._write(proj, "sonnet")
+            self.assertEqual(mc._claude_configured_models(proj), [])
+
+    def test_missing_and_malformed_yield_nothing(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(mc.Path, "home", return_value=Path(td) / "nohome"):
+            proj = Path(td) / "proj"  # no .claude/settings.json at all
+            self.assertEqual(mc._claude_configured_models(proj), [])
+            self._write(proj, None)   # settings.json without a model key
+            self.assertEqual(mc._claude_configured_models(proj), [])
+            (proj / ".claude" / "settings.json").write_text("{not json", encoding="utf-8")
+            self.assertEqual(mc._claude_configured_models(proj), [])
+
+    def test_shipped_baseline_includes_current_family(self):
+        # Even with no live config, the refreshed shipped aliases must surface
+        # the current family (task 015 regression guard).
+        with mock.patch.object(mc, "_claude_configured_models", return_value=[]):
+            cands = mc.claude_candidate_models(["opus", "sonnet", "haiku", "codex:gpt-5.5", "agy"])
+        self.assertIn("claude-fable-5", cands)
+        self.assertIn("claude-sonnet-5", cands)
+
+    def test_configured_model_leads_candidates(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(mc.Path, "home", return_value=Path(td) / "nohome"):
+            proj = Path(td) / "proj"
+            self._write(proj, "claude-fable-5[1m]")
+            cands = mc.claude_candidate_models(["opus"], None, proj)
+        self.assertEqual(cands[0], "claude-fable-5[1m]")
+        self.assertIn("claude-fable-5", cands)
+
+
 class CheckPinsTest(unittest.TestCase):
     """Verdict cross-check with all provider I/O monkeypatched (no network)."""
 

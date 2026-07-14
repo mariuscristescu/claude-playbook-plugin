@@ -396,15 +396,57 @@ def probe_claude_model(model: str, timeout: int = PROBE_TIMEOUT_SECS) -> tuple[s
     return UNKNOWN, f"probe failed for another reason: {first}"
 
 
-def claude_candidate_models(panel_specs: list[str], extra: Optional[list[str]] = None) -> list[str]:
-    """Claude ids worth probing: pins ∪ shipped alias targets ∪ user-supplied.
+def _claude_configured_models(project_root: Optional[Path] = None) -> list[str]:
+    """Claude model id(s) the user's Claude Code is actually configured to run.
 
-    Claude has no list API, so genuinely NEW models can only enter via
-    `--claude-candidates` (or a pin) — the report labels this section
-    "known candidates only".
+    Claude has no list command (anthropics/claude-code#12612) and the Models
+    API needs a key — but Claude Code records the selected model in its own
+    settings, a key-free live signal we can read the way we read
+    ~/.codex/models_cache.json for codex. Reads the `model` field from
+    ~/.claude/settings.json (user scope) and <project_root>/.claude/settings.json
+    (project scope). Returns each `claude-*` id plus its bracket-stripped bare
+    form (e.g. 'claude-fable-5[1m]' -> ['claude-fable-5[1m]', 'claude-fable-5'])
+    so both the exact configured id and the plain id get probed. Short alias
+    words ('sonnet', 'default') are skipped — the shipped alias baseline already
+    covers those. Defensive: a missing/unreadable/malformed file yields nothing.
+    """
+    import json
+    import re
+    out: list[str] = []
+    paths = [Path.home() / ".claude" / "settings.json"]
+    if project_root is not None:
+        paths.append(Path(project_root) / ".claude" / "settings.json")
+    for p in paths:
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        m = raw.get("model") if isinstance(raw, dict) else None
+        if not isinstance(m, str) or not m.strip().startswith("claude-"):
+            continue
+        m = m.strip()
+        out.append(m)
+        bare = re.sub(r"\[.*?\]\s*$", "", m).strip()
+        if bare and bare != m:
+            out.append(bare)
+    return out
+
+
+def claude_candidate_models(panel_specs: list[str], extra: Optional[list[str]] = None,
+                            project_root: Optional[Path] = None) -> list[str]:
+    """Claude ids worth probing, most-live first:
+    Claude Code's configured model ∪ pins ∪ shipped alias targets ∪ user-supplied.
+
+    Claude has no list API/CLI command, so the set is assembled from live
+    signals rather than one hardcoded table: `_claude_configured_models` reads
+    the model the user's Claude Code is actually set to (key-free), pins and
+    shipped aliases seed the current family, and `--claude-candidates` covers
+    anything newer. Each is probed to confirm availability.
     """
     from provider.sandbox import MODEL_ALIASES, resolve_judge_spec
     candidates: list[str] = []
+    # Live signal first: what Claude Code is actually configured to run.
+    candidates.extend(_claude_configured_models(project_root))
     for nm in panel_specs:
         try:
             provider, variant = resolve_judge_spec(nm)
@@ -578,7 +620,7 @@ def check_pins(project_root: Path, probe: bool = True,
 
     return {"entries": entries, "codex": codex_cache, "codex_cli_version": codex_version,
             "agy_models": agy_models, "grok_models": grok_models,
-            "claude_candidates": claude_candidate_models(specs, claude_candidates),
+            "claude_candidates": claude_candidate_models(specs, claude_candidates, project_root),
             "warnings": warnings}
 
 
@@ -605,8 +647,9 @@ def render_report(report: dict) -> str:
         for name in report["grok_models"]:
             lines.append(f"  {name}")
     if report.get("claude_candidates"):
-        lines.append("\n=== claude candidates (known ids only — claude has no list "
-                     "command; add new ids with --claude-candidates) ===")
+        lines.append("\n=== claude candidates (probed — claude has no list command, so this "
+                     "is your Claude Code configured model ∪ pins ∪ known ids; add more "
+                     "with --claude-candidates) ===")
         for model in report["claude_candidates"]:
             lines.append(f"  {model}")
     for w in report.get("warnings", []):
