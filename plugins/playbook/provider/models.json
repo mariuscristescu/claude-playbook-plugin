@@ -1,11 +1,12 @@
 {
-  "_doc": "Model aliases for bin/sandbox --model <alias> AND judge selection. Each alias entry is [agent, canonical_model_or_null, [extra_args]]. 'default_judge' is the single plan/impl-review backend when --backend is omitted (provider or provider:variant). 'panel' is the default panel-review judge set (entries are 'provider:variant' or a bare provider; an alias name also works). For codex entries only, the variant accepts an optional ':effort' suffix (minimal|low|medium|high|xhigh|max|ultra — per-model validity comes from ~/.codex/models_cache.json supported_reasoning_levels), e.g. 'codex:gpt-5.5:medium' -> `-c model_reasoning_effort=medium` -- without it, Codex falls back to ~/.codex/config.toml's model_reasoning_effort (often 'high', which is why uncapped panel runs get expensive). Override per-project by shadowing with .agent/models.json; override per-run with --models / --backend / --model. Model strings drift between releases — edit values here when an upstream version changes. Schema is stable; only values move.",
-  "_updated": "2026-07-07",
+  "_doc": "Model aliases for bin/sandbox --model <alias> AND judge selection. Each alias entry is [agent, canonical_model_or_null, [extra_args]]. 'default_judge' is the single plan/impl-review backend when --backend is omitted (provider or provider:variant). 'panel' is the default panel-review judge set (entries are 'provider:variant' or a bare provider; an alias name also works). For codex entries only, the variant accepts an optional ':effort' suffix (minimal|low|medium|high|xhigh|max|ultra — per-model validity comes from ~/.codex/models_cache.json supported_reasoning_levels), e.g. 'codex:gpt-5.5:medium' -> `-c model_reasoning_effort=medium` -- without it, Codex falls back to ~/.codex/config.toml's model_reasoning_effort (often 'high', which is why uncapped panel runs get expensive). Override per-project by shadowing with .agent/models.json; override per-run with --models / --backend / --model. Model strings drift between releases — edit values here when an upstream version changes. Schema is stable; only values move. Current Claude family (2026-07-14): fable=claude-fable-5, opus=claude-opus-4-8, sonnet=claude-sonnet-5, haiku=claude-haiku-4-5. These aliases are only a baseline seed for `tasks models check` — it also probes the model your Claude Code is actually set to (~/.claude/settings.json) since claude has no list command, so a newer model you're running is surfaced even if it's not listed here.",
+  "_updated": "2026-07-14",
   "default_judge": "codex",
   "panel": ["opus", "sonnet", "haiku", "codex:gpt-5.5", "agy"],
   "aliases": {
+    "fable":    ["claude", "claude-fable-5", []],
     "opus":     ["claude", "claude-opus-4-8[1m]", []],
-    "sonnet":   ["claude", "claude-sonnet-4-6", []],
+    "sonnet":   ["claude", "claude-sonnet-5", []],
     "haiku":    ["claude", "claude-haiku-4-5", []],
     "gpt":      ["codex", "gpt-5.5", []],
     "gpt-codex": ["codex", "gpt-5.3-codex", []],
