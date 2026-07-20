@@ -54,20 +54,24 @@ def _parse_task(num: int, slug: str, content: str) -> dict:
     status = _extract_status(lines)
     parked = _extract_section(lines, "Parked")
 
-    # Gate analysis
-    gate_pattern = re.compile(r'^\s*- \[( |x|X)\]\s*(.*)')
+    # Gate analysis. Capture line index + indent so the bare-checkmark heuristic
+    # can inspect continuation lines beneath a gate (task 018 / bug report #5a).
+    gate_pattern = re.compile(r'^(\s*)- \[( |x|X)\]\s*(.*)')
     gates = []
-    for line in lines:
+    for idx, line in enumerate(lines):
         m = gate_pattern.match(line)
         if m:
-            checked = m.group(1) in ('x', 'X')
-            text = m.group(2).strip()
-            gates.append({"checked": checked, "text": text})
+            gates.append({
+                "checked": m.group(2) in ('x', 'X'),
+                "text": m.group(3).strip(),
+                "line": idx,
+                "indent": len(m.group(1)),
+            })
 
     checked_count = sum(1 for g in gates if g["checked"])
     # Bare checkmark: checked gate where the agent didn't append any outcome.
-    # Heuristic: text is very short (≤60 chars) and doesn't contain outcome markers
-    # like " — ", ":", ".", or result words. Template gates are typically short labels.
+    # Heuristic: text is very short (≤60 chars), lacks outcome markers, AND has no
+    # indented continuation content beneath it. Template gates are short labels.
     bare_count = 0
     for g in gates:
         if not g["checked"]:
@@ -80,6 +84,11 @@ def _parse_task(num: int, slug: str, content: str) -> dict:
         if any(marker in text for marker in [" — ", " - ", "✓", "✗", "passing", "passed", "fixed"]):
             continue
         if re.search(r':\s+\S|\.\s+\S', text):
+            continue
+        # Continuation lines beneath the gate (numbered sub-bullets, `→` lines,
+        # any deeper-indented content) ARE the annotation — not bare (5a: 17/17
+        # flagged "bare" gates were continuation-annotated false positives).
+        if _gate_has_continuation(lines, g["line"], g["indent"]):
             continue
         bare_count += 1
 
@@ -107,6 +116,34 @@ def _parse_task(num: int, slug: str, content: str) -> dict:
         "parked_items": parked_items,
         "playbook_type": playbook_type,
     }
+
+
+_GATE_LINE_RE = re.compile(r'^\s*- \[[ xX]\]')
+
+
+def _gate_has_continuation(lines: list[str], line_idx: int, indent: int) -> bool:
+    """True if the gate at `line_idx` is annotated by continuation content on the
+    following lines — a deeper-indented sub-bullet/prose, or a `→` line. This is
+    how agents annotate multi-part outcomes ("Fix — 4 changes:" then numbered
+    sub-bullets), so such a gate is NOT a bare checkmark (bug report #5a).
+
+    Only the first non-blank line after the gate is inspected, and a same-or-less
+    indented new gate ends the gate's scope — so an unrelated indented block far
+    below can't mask a genuinely bare gate."""
+    for i in range(line_idx + 1, len(lines)):
+        raw = lines[i]
+        stripped = raw.strip()
+        if not stripped:
+            continue  # skip blank lines between a gate and its continuation
+        if stripped.startswith("→"):
+            return True
+        line_indent = len(raw) - len(raw.lstrip())
+        # A new gate at same-or-shallower indent = next gate; scope ended.
+        if _GATE_LINE_RE.match(raw) and line_indent <= indent:
+            return False
+        # Deeper-indented non-gate content = this gate's annotation.
+        return line_indent > indent
+    return False
 
 
 def _extract_section(lines: list[str], heading: str) -> str:
