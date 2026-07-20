@@ -48,6 +48,11 @@ AGENT_FILE_ALLOW = {"chat_log.md", "bash_history", "bash_log.md"}
 MONITOR_ALLOW = {"session.md", "rules.md", "MONITOR_MIND_MAP.md", "trace.md", "nudge.md"}
 HOOK_CONFIGS = (Path(".claude/settings.json"), Path(".codex/hooks.json"))
 
+# Per-user namespacing ([30]): work can live under `.agent/<user>/tasks/` instead
+# of `.agent/tasks/`. These `.agent/` children are NOT user lanes — they're the
+# shared/runtime subdirs, so `_agent_lanes` skips them when enumerating users.
+_RESERVED_AGENT_DIRS = {"tasks", "sessions", "monitor", "playbooks"}
+
 HARD_EXCLUDED_NAMES = {".DS_Store", ".offset", ".pid", "sandbox.sb"}
 HARD_EXCLUDED_SUFFIXES = {".py", ".pyc"}
 HARD_EXCLUDED_PARTS = {"__pycache__"}
@@ -128,15 +133,21 @@ def collect_global_retro(
             continue
 
         included_task_dirs = []
-        for task_dir in task_dirs:
+        included_lanes: set[str | None] = set()
+        for lane_user, task_dir in task_dirs:
             cutoff_ts, cutoff_source = _task_cutoff_timestamp(project, task_dir)
             if cutoff_ts >= cutoff:
                 match = TASK_DIR_RE.match(task_dir.name)
                 included_task_dirs.append(task_dir)
+                included_lanes.add(lane_user)
                 entry["included_tasks"].append({
                     "number": int(match.group("number")) if match else None,
                     "slug": match.group("slug") if match else task_dir.name,
                     "dir": task_dir.name,
+                    # lane + full relative path disambiguate duplicate task numbers
+                    # across per-user lanes (marius/001-* vs cristi/001-*) [T9].
+                    "lane": lane_user,
+                    "path": _posix(task_dir.relative_to(project)),
                     "cutoff_ts": cutoff_ts.isoformat().replace("+00:00", "Z"),
                     "cutoff_source": cutoff_source,
                 })
@@ -147,7 +158,14 @@ def collect_global_retro(
             continue
 
         entry["kept"] = True
-        selected = _select_project_files(project, included_task_dirs, max_file_bytes)
+        # Agent files (chat_log, bash_history, playbooks, monitor) are collected
+        # per lane: always the root `.agent/` (back-compat top-level files) plus
+        # each per-user lane that contributed an included task.
+        agent_reldirs = [Path(".agent")]
+        for lane_user, lane_rel in _agent_lanes(project):
+            if lane_user is not None and lane_user in included_lanes and lane_rel not in agent_reldirs:
+                agent_reldirs.append(lane_rel)
+        selected = _select_project_files(project, included_task_dirs, max_file_bytes, agent_reldirs)
         for relpath, reason in selected["skipped"]:
             entry["skipped_files"].append({"path": _posix(relpath), "reason": reason})
         for relpath in selected["included"]:
@@ -215,7 +233,12 @@ def _discover_candidates(roots: list[Path]) -> list[tuple[Path, str]]:
                 continue
             project = Path(dirpath).resolve()
             agent = project / ".agent"
-            if (agent / "tasks").exists():
+            # Qualify on the ROOT tasks dir OR any per-user lane `.agent/<user>/tasks/`
+            # ([30]). The glob must run here, inside the `.agent`-found branch and
+            # BEFORE the prune below — os.walk never descends into `.agent`, so a
+            # predicate that only inspects the root tasks dir would never see the
+            # per-user lanes (task 018 panel T8).
+            if _agent_lanes(project):
                 found.setdefault(project, "has .agent/tasks")
                 dirnames[:] = []
             else:
@@ -224,15 +247,47 @@ def _discover_candidates(roots: list[Path]) -> list[tuple[Path, str]]:
     return sorted(found.items(), key=lambda item: str(item[0]))
 
 
-def _valid_task_dirs(project: Path) -> list[Path]:
-    tasks_dir = project / ".agent" / "tasks"
-    if not tasks_dir.exists():
-        return []
-    result = []
-    for child in tasks_dir.iterdir():
-        if child.is_dir() and TASK_DIR_RE.match(child.name) and (child / "task.md").is_file():
-            result.append(child)
-    return sorted(result, key=lambda p: p.name)
+def _agent_lanes(project: Path) -> list[tuple[str | None, Path]]:
+    """Return the task-bearing lanes of a project, each as (user, agent_reldir).
+
+    A lane is a directory holding a `tasks/` subdir:
+      - the root lane          → (None, Path('.agent'))
+      - a per-user lane [30]   → ('<user>', Path('.agent/<user>'))
+
+    Reserved `.agent/` children (tasks, sessions, monitor, playbooks) are never
+    treated as user lanes. Root single-user repos yield exactly [(None, .agent)],
+    so downstream collection stays byte-identical to the pre-multi-user behavior.
+    """
+    agent = project / ".agent"
+    lanes: list[tuple[str | None, Path]] = []
+    if (agent / "tasks").is_dir():
+        lanes.append((None, Path(".agent")))
+    if agent.is_dir():
+        for child in sorted(agent.iterdir(), key=lambda p: p.name):
+            if (child.is_dir() and child.name not in _RESERVED_AGENT_DIRS
+                    and (child / "tasks").is_dir()):
+                lanes.append((child.name, Path(".agent") / child.name))
+    return lanes
+
+
+def _valid_task_dirs(project: Path) -> list[tuple[str | None, Path]]:
+    """Return (lane_user, task_dir) for every valid task across ALL lanes ([30]).
+
+    lane_user is None for the root `.agent/tasks/` lane, or the '<user>' for a
+    per-user `.agent/<user>/tasks/` lane. Duplicate task NUMBERS across lanes
+    (marius/001-* and cristi/001-*) are both returned — they're distinguished
+    downstream by their full path + lane, never collapsed. Sorted by lane then
+    dir name for deterministic output; a single-user root repo yields the same
+    task set (all lane_user=None) it did before multi-user support."""
+    result: list[tuple[str | None, Path]] = []
+    for lane_user, lane_rel in _agent_lanes(project):
+        tasks_dir = project / lane_rel / "tasks"
+        if not tasks_dir.is_dir():
+            continue
+        for child in tasks_dir.iterdir():
+            if child.is_dir() and TASK_DIR_RE.match(child.name) and (child / "task.md").is_file():
+                result.append((lane_user, child))
+    return sorted(result, key=lambda item: (item[0] or "", item[1].name))
 
 
 def _task_cutoff_timestamp(project: Path, task_dir: Path) -> tuple[dt.datetime, str]:
@@ -285,7 +340,18 @@ def _git_first_add_timestamp(project: Path, task_file: Path) -> dt.datetime | No
         return None
 
 
-def _select_project_files(project: Path, task_dirs: list[Path], max_file_bytes: int) -> dict[str, list]:
+def _select_project_files(
+    project: Path,
+    task_dirs: list[Path],
+    max_file_bytes: int,
+    agent_reldirs: list[Path] | None = None,
+) -> dict[str, list]:
+    """Select the files to collect. `agent_reldirs` is the list of lane agent
+    dirs (e.g. `.agent`, `.agent/marius`) whose chat_log/bash_history/playbooks/
+    monitor files are gathered; defaults to `[.agent]` so a root-only repo keeps
+    the exact byte-layout it had before multi-user support ([30])."""
+    if agent_reldirs is None:
+        agent_reldirs = [Path(".agent")]
     included: set[Path] = set()
     skipped: list[tuple[Path, str]] = []
 
@@ -299,20 +365,21 @@ def _select_project_files(project: Path, task_dirs: list[Path], max_file_bytes: 
 
     for name in sorted(TOP_LEVEL_ALLOW):
         consider(Path(name))
-    for name in sorted(AGENT_FILE_ALLOW):
-        consider(Path(".agent") / name)
     for relpath in HOOK_CONFIGS:
         consider(relpath)
 
-    playbooks = project / ".agent" / "playbooks"
-    if playbooks.exists():
-        for path in sorted(playbooks.rglob("*.md")):
-            consider(path.relative_to(project))
-
-    monitor = project / ".agent" / "monitor"
-    if monitor.exists():
-        for name in sorted(MONITOR_ALLOW):
-            consider(Path(".agent") / "monitor" / name)
+    # Per-lane agent artifacts (root `.agent/` and any per-user `.agent/<user>/`).
+    for agent_rel in agent_reldirs:
+        for name in sorted(AGENT_FILE_ALLOW):
+            consider(agent_rel / name)
+        playbooks = project / agent_rel / "playbooks"
+        if playbooks.exists():
+            for path in sorted(playbooks.rglob("*.md")):
+                consider(path.relative_to(project))
+        monitor = project / agent_rel / "monitor"
+        if monitor.exists():
+            for name in sorted(MONITOR_ALLOW):
+                consider(agent_rel / "monitor" / name)
 
     for task_dir in task_dirs:
         for path in sorted(task_dir.rglob("*")):
