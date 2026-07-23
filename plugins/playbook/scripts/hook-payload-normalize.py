@@ -41,7 +41,23 @@ import re
 import sys
 
 # Claude never emits these tool names; grok 0.2.99 does (captured live).
-_TOOL_NAMES = {"StrReplace": "Edit", "Shell": "Bash"}
+_TOOL_NAMES = {
+    "StrReplace": "Edit",
+    "Shell": "Bash",
+    # Grok Build current names (docs + 2026-07 live sessions): Edit/Write alias
+    # to search_replace, Bash to run_terminal_command; `write` is a distinct
+    # create-file tool that must still map to Write for task-gate Guard 0/1.
+    "search_replace": "Edit",
+    "write": "Write",
+    "run_terminal_command": "Bash",
+}
+
+# Remap these even WITHOUT camelCase dialect markers (hybrid hosts, panel 020).
+# StrReplace/Shell stay dialect-gated so a pure snake_case Claude payload that
+# happens to mention those strings is still byte-identical (task 014 contract).
+_TOOL_NAMES_ALWAYS = frozenset(
+    {"search_replace", "write", "run_terminal_command"}
+)
 
 # grok-native tool_input keys → Claude keys. Applied additively (grok key
 # kept, Claude key added) and only when the Claude key is absent.
@@ -77,8 +93,25 @@ def is_foreign_dialect(payload) -> bool:
     return isinstance(payload, dict) and any(k in payload for k in _DIALECT_MARKERS)
 
 
+def has_foreign_tool_name(payload) -> bool:
+    """True if tool_name is a Grok name that must remap without dialect markers.
+
+    Hybrid hosts may send write/search_replace/run_terminal_command with
+    snake_case keys only; without remap, Guard 1 fail-opens (panel 020).
+    StrReplace/Shell remain dialect-marker-gated (byte-identity for Claude).
+    """
+    if not isinstance(payload, dict):
+        return False
+    tn = payload.get("tool_name")
+    return isinstance(tn, str) and tn in _TOOL_NAMES_ALWAYS
+
+
+def needs_normalize(payload) -> bool:
+    return is_foreign_dialect(payload) or has_foreign_tool_name(payload)
+
+
 def normalize(payload):
-    if not is_foreign_dialect(payload):
+    if not needs_normalize(payload):
         return payload
     out = dict(payload)
     for camel, snake in _TOP_KEYS.items():
@@ -109,14 +142,13 @@ def main():
     except Exception:
         sys.stdout.write(raw)  # non-JSON → verbatim (hooks' own fallbacks apply)
         return
-    if not is_foreign_dialect(payload):
+    if not needs_normalize(payload):
         sys.stdout.write(raw)  # native claude → BYTE-IDENTICAL passthrough
         return
-    # Foreign dialect: emit the normalized payload. Compact separators keep the
-    # output shape claude-native (no space after ':'/',') so downstream grep
-    # fallbacks that expect the compact form still match.
+    # Foreign dialect / foreign tool names: emit the normalized payload.
+    # Compact separators keep the output shape claude-native (no space after
+    # ':'/',') so downstream grep fallbacks that expect the compact form still match.
     sys.stdout.write(json.dumps(normalize(payload), separators=(",", ":")))
-
 
 if __name__ == "__main__":
     main()

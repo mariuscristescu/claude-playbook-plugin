@@ -6,14 +6,15 @@
 # Generates PLAYBOOK_SESSION_ID, provisions the session directory, then execs
 # grok so the agent (and every hook process it spawns) inherits the env.
 #
-# Grok discovers the playbook hooks natively — it reads the project's
-# .claude/settings.json and installed Claude Code plugins through its
-# Claude-compat layer (verified live, grok 0.2.99 / task 014). The hook
-# payload dialect is translated by scripts/hook-payload-normalize.py.
-# ONE-TIME STEP per project: run /hooks-trust inside a grok session here,
-# or project hooks are silently skipped (folder-trust gate,
-# ~/.grok/trusted_folders.toml). Grok's Stop hook cannot block, so
-# anti-walk-away enforcement is soft (same boundary as pi).
+# Enforcement channel (task 020): always-trusted
+# ~/.grok/hooks/playbook-enforcement.json — written by
+# `tasks init --provider grok` (auto-installs hooks). Required on spaced
+# project paths (iCloud) where project/plugin hooks never schedule.
+# Restart the Grok session after install/upgrade so hooks reload.
+# Project-level hooks (monitor-nudge, etc.) still need /hooks-trust once.
+# Payload dialect: scripts/hook-payload-normalize.py (camelCase + tool
+# renames write/search_replace/run_terminal_command). Stop cannot block
+# (soft anti-walk-away, same boundary as pi).
 #
 # See provider/adapters/grok.py launch_interactive() for the programmatic
 # equivalent (assumes env pre-set).

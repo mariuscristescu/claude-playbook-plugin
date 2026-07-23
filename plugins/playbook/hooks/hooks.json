@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/session-start-hook\"",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/session-start-hook\"",
             "timeout": 5000
           }
         ]
@@ -13,11 +13,11 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|Bash|Shell|StrReplace",
+        "matcher": "Edit|Write|search_replace|write|Bash|Shell|StrReplace|run_terminal_command",
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/task-gate-hook\"",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/task-gate-hook\"",
             "timeout": 5000
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/chat-log-hook\"",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/chat-log-hook\"",
             "statusMessage": "Logging to chat_log.md"
           }
         ]
@@ -40,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/state-echo-hook\"",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/state-echo-hook\"",
             "timeout": 5000
           }
         ]
@@ -51,7 +51,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/stop-hook\"",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/stop-hook\"",
             "timeout": 5000
           }
         ]
@@ -62,7 +62,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/session-end-hook\"",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/session-end-hook\"",
             "timeout": 5000
           }
         ]

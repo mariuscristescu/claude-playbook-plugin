@@ -48,6 +48,7 @@ model. composer stays reachable via an explicit `grok:grok-composer-2.5-fast`.
 """
 
 from __future__ import annotations
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -63,6 +64,126 @@ from ..capabilities import ProviderCapabilities
 # `grok:model:effort` pin raises at spec-parse time instead of reaching `-m`
 # as a bogus token.
 _REASONING_EFFORTS = frozenset({"low", "medium", "high"})
+
+# Always-trusted global hooks dir (task 020). Project/plugin hooks are
+# folder-trust-gated and, on Grok sessions under spaced project paths
+# (e.g. iCloud "Mobile Documents"), are never scheduled — live survey
+# 2026-07-23: 0 project/plugin hook runs under those paths. Global
+# ~/.grok/hooks/*.json always load.
+_GROK_ENFORCEMENT_HOOKS_FILENAME = "playbook-enforcement.json"
+# Matcher covers Claude names + Grok aliases/native names (docs: Write/Edit
+# → search_replace, Bash → run_terminal_command; Grok also has a distinct
+# `write` tool for creates that does not always alias to Write).
+_GROK_PRETOOL_MATCHER = (
+    "Edit|Write|search_replace|write|"
+    "Bash|Shell|StrReplace|run_terminal_command"
+)
+
+
+def resolve_playbook_plugin_root() -> Path:
+    """Return the playbook plugin root that contains scripts/ and hooks/.
+
+    Canonical layout: `<plugin_root>/provider/adapters/grok.py`
+    Mirror layout:    `<plugin_root>/scripts/lib/provider/adapters/grok.py`
+
+    The mirror is a live import path in some installed contexts (see
+    codex_hooks.playbook_scripts_dir); three-parent walk alone would resolve
+    the mirror to `scripts/lib` and install_hooks would no-op.
+    """
+    here = Path(__file__).resolve()
+    # Mirror: .../scripts/lib/provider/adapters/grok.py → plugin root is parents[4]
+    if (
+        here.parent.name == "adapters"
+        and here.parent.parent.name == "provider"
+        and here.parent.parent.parent.name == "lib"
+        and here.parent.parent.parent.parent.name == "scripts"
+    ):
+        return here.parent.parent.parent.parent.parent
+    # Canonical: .../provider/adapters/grok.py → plugin root is parents[2]
+    if here.parent.name == "adapters" and here.parent.parent.name == "provider":
+        root = here.parent.parent.parent
+        if (root / "scripts" / "task-gate-hook").exists():
+            return root
+    # Fallback: walk parents until scripts/task-gate-hook exists
+    for parent in here.parents:
+        if (parent / "scripts" / "task-gate-hook").exists():
+            return parent
+    raise RuntimeError(f"Cannot resolve playbook plugin root from {here}")
+
+
+def build_enforcement_hooks_payload(plugin_root: Path) -> dict:
+    """Build the hooks.json body written to ~/.grok/hooks/playbook-enforcement.json.
+
+    Commands use space-safe absolute paths (`bash "/abs/path/script"`) so a
+    spaced plugin root (iCloud checkout) still works as Grok inline-shell.
+    CLAUDE_PLUGIN_ROOT / GROK_PLUGIN_ROOT are set in each hook's env map so
+    scripts that expand those vars still resolve.
+    """
+    plugin_root = plugin_root.resolve()
+    scripts = plugin_root / "scripts"
+    env = {
+        "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+        "GROK_PLUGIN_ROOT": str(plugin_root),
+        "PLAYBOOK_PROVIDER": "grok",
+    }
+
+    def entry(script_name: str, *, timeout: int = 5000, status_message: Optional[str] = None) -> dict:
+        path = (scripts / script_name).resolve()
+        hook: dict = {
+            "type": "command",
+            "command": f'bash "{path}"',
+            "timeout": timeout,  # milliseconds (same unit as hooks.json / HOOK_TIMEOUT_MS)
+            "env": dict(env),
+        }
+        if status_message:
+            hook["statusMessage"] = status_message
+        return hook
+
+    return {
+        "hooks": {
+            "SessionStart": [
+                {"hooks": [entry("session-start-hook")]}
+            ],
+            "PreToolUse": [
+                {
+                    "matcher": _GROK_PRETOOL_MATCHER,
+                    "hooks": [entry("task-gate-hook")],
+                }
+            ],
+            "UserPromptSubmit": [
+                {
+                    "hooks": [
+                        entry(
+                            "chat-log-hook",
+                            status_message="Logging to chat_log.md",
+                        )
+                    ]
+                }
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": ".*",
+                    "hooks": [entry("state-echo-hook")],
+                }
+            ],
+            "Stop": [
+                {"hooks": [entry("stop-hook")]}
+            ],
+            "SessionEnd": [
+                {"hooks": [entry("session-end-hook")]}
+            ],
+        }
+    }
+
+
+def grok_enforcement_hooks_path() -> Path:
+    """Path of the always-trusted global enforcement hooks file.
+
+    Override with PLAYBOOK_GROK_HOOKS_DIR (directory) for tests.
+    """
+    override = os.environ.get("PLAYBOOK_GROK_HOOKS_DIR")
+    base = Path(override) if override else (Path.home() / ".grok" / "hooks")
+    return base / _GROK_ENFORCEMENT_HOOKS_FILENAME
 
 
 def _split_reasoning_effort(model: str) -> tuple[str, Optional[str]]:
@@ -201,50 +322,73 @@ class GrokAdapter(ProviderAdapter):
             target.write_text(agents_md_template(), encoding="utf-8")
 
     # ── Hooks ─────────────────────────────────────────────────────────────────
-    # grok discovers playbook hooks through TWO native channels, no config
-    # mutation needed: (1) project `.claude/settings.json` (written by
-    # `tasks init` in every playbook project), (2) the installed playbook
-    # Claude Code plugin's hooks.json. Both are folder-trust-gated: project
-    # hooks stay silently OFF until a human runs `/hooks-trust` once inside
-    # the project (recorded in ~/.grok/trusted_folders.toml). That grant is
-    # interactive by design — install_hooks can only remind, not automate.
+    # Discovery channels (task 014–020):
+    #   (1) project `.claude/settings.json` — folder-trust-gated
+    #   (2) installed Claude plugin hooks.json — folder-trust-gated / plugin load
+    #   (3) always-trusted `~/.grok/hooks/playbook-enforcement.json` (task 020)
+    # On real Grok under spaced project paths (iCloud Mobile Documents), (1) and
+    # (2) are never scheduled (0 hook runs in session survey). (3) is the
+    # reliable enforcement channel. Plugin hooks.json still ships dual-host
+    # `bash "${CLAUDE_PLUGIN_ROOT}/…"` for Claude Code + space-free Grok hosts.
 
     def install_hooks(self, project_root: Path) -> None:
-        """No file writes needed — grok reads .claude/settings.json natively.
+        """Install always-trusted global Grok enforcement hooks + print status.
 
-        Prints the one-time folder-trust step, the only part that needs a
-        human, plus a space-in-path note. Idempotent.
+        Writes `~/.grok/hooks/playbook-enforcement.json` with absolute
+        `bash "/path/to/script"` commands (space-safe) pointing at this
+        plugin's scripts/. Idempotent. Also reminds about folder-trust for
+        project-level hooks (monitor-nudge, etc.).
 
-        SPACE-IN-PATH (task 014): grok expands `${CLAUDE_PLUGIN_ROOT}` in a
-        hook `command` and then WORD-SPLITS the result (a plain POSIX shell
-        does the same), so an unquoted command whose resolved path contains a
-        SPACE breaks — the hook never launches and enforcement fail-opens.
-        hooks.json now double-quotes every command
-        (`"${CLAUDE_PLUGIN_ROOT}/scripts/<hook>"`), which keeps the path a
-        single argument under both grok and a real shell — verified at the
-        shell level (quoted expansion = 1 arg) and against grok
-        (quoted spaced command launches; bare does not). Normal installs
-        (~/.claude/plugins/.../playbook/<ver>) are space-free, so the quoting
-        is a no-op there; it hardens spaced checkouts like this dogfooding
-        iCloud dir. If enforcement still doesn't fire under grok, confirm the
-        folder is trusted (/hooks-trust) and that the installed plugin is
-        v1.4.0+.
+        Override output directory with PLAYBOOK_GROK_HOOKS_DIR (tests).
         """
+        plugin_root = resolve_playbook_plugin_root()
+        scripts = plugin_root / "scripts"
+        if not (scripts / "task-gate-hook").exists():
+            print(f"  grok hooks   FAIL: scripts missing under {plugin_root}")
+            return
+
+        target = grok_enforcement_hooks_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = build_enforcement_hooks_payload(plugin_root)
+        # Atomic write: temp in same dir + os.replace (crash mid-write must not
+        # leave truncated JSON that Grok would reject → silent fail-open).
+        text = json.dumps(payload, indent=2) + "\n"
+        tmp = target.with_name(target.name + f".tmp.{os.getpid()}")
+        try:
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, target)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        print(f"  grok hooks   wrote always-trusted {target}")
+        print("               PreToolUse task-gate + PostToolUse state-echo + chat-log +")
+        print("               session/stop hooks (absolute bash paths; spaced roots OK)")
+        print("               restart the Grok session so hooks reload (snapshot at start)")
+        print("               re-run after plugin upgrade if script paths go stale")
+
         settings = project_root / ".claude" / "settings.json"
         if not settings.exists():
-            print("  grok hooks   .claude/settings.json missing — run `tasks init` first")
-            return
-        print("  grok hooks   auto-discovered from .claude/settings.json (Claude compat)")
-        print("               one-time step: run /hooks-trust inside a grok session in this")
-        print("               project, or project hooks are silently skipped")
-        # hooks.json quotes the command, so a spaced plugin path is handled;
-        # still surface it as a heads-up since it's the fragile area.
-        if " " in str(Path(__file__).resolve()):
-            print("               note: plugin path contains a space — handled by quoted hook")
-            print("               commands (hooks.json); if a gate doesn't fire, re-check trust.")
+            print("  grok hooks   note: .claude/settings.json missing — run `tasks init` for")
+            print("               project deny-list + monitor-nudge (still needs /hooks-trust)")
+        else:
+            print("  grok hooks   project .claude/settings.json present — /hooks-trust once if")
+            print("               project hooks (monitor-nudge) should also fire")
 
     def uninstall_hooks(self, project_root: Path) -> None:
-        """Nothing to remove — grok reads the shared .claude/settings.json."""
+        """Remove the always-trusted global enforcement hooks file if present.
+
+        Note: the file is machine-global (not per-project). Uninstall disables
+        enforcement for every Grok project on this host.
+        """
+        target = grok_enforcement_hooks_path()
+        if target.exists():
+            target.unlink()
+            print(f"  grok hooks   removed {target} (global — all Grok projects)")
+        else:
+            print(f"  grok hooks   no global enforcement file at {target}")
 
     # ── Launch ───────────────────────────────────────────────────────────────
 

@@ -1371,8 +1371,14 @@ def main():
             adapter = adapter_cls("init", target)
             adapter.install_bootstrap(target)
             print(f"  {bootstrap_file:<15}{'exists' if already_existed else 'created'}")
-            if install_provider_hooks:
+            # Grok: always install global enforcement hooks (task 020). On spaced
+            # project paths, project/plugin hooks never schedule — the always-
+            # trusted ~/.grok/hooks/playbook-enforcement.json is the only reliable
+            # channel. --hooks remains required for other providers.
+            if install_provider_hooks or provider == "grok":
                 adapter.install_hooks(target)
+                if provider == "grok" and not install_provider_hooks:
+                    print("  grok hooks   auto-installed (required on Grok; pass --hooks to be explicit)")
         elif install_provider_hooks:
             print("Error: --hooks requires --provider codex, antigravity, grok, or pi", file=sys.stderr)
             sys.exit(1)
@@ -3072,6 +3078,38 @@ def main():
                     warn(f"gate-logging: lane '{label}'", gap)
         except Exception as e:  # advisory — doctor must never crash here
             warn("gate-logging: lane scan ran", f"skipped ({e})")
+
+        # 1f. Hook command quoting (task 019 / field bug AloVet 2026-07-20).
+        # Every hooks.json `command` was quote-wrapped, which grok resolves as
+        # a literal path -> command-not-found -> all six hooks fail-open. Scan
+        # the copies the host actually loads (CLAUDE_PLUGIN_ROOT, the copy next
+        # to this module, the workspace source tree, and grok's own ~/.grok
+        # copies), not just the source tree — a clean checkout is not proof the
+        # running install is clean. Missing copies are silently skipped.
+        # Advisory; never crashes doctor.
+        try:
+            from tasks.hooks_check import hooks_check_report
+            for _label, _detail in hooks_check_report(project_path):
+                warn(_label, _detail)
+        except Exception as e:  # advisory — doctor must never crash here
+            warn("hooks: command-quoting check ran", f"skipped ({e})")
+
+        # 1g. Grok always-trusted global enforcement file (task 020).
+        # Absolute script pins go stale on upgrade/move → fail-open. Also flag
+        # a missing file when AGENTS.md exists (Grok bootstrap present).
+        try:
+            from tasks.hooks_check import grok_enforcement_report, grok_enforcement_issues
+            agents_md = project_path / "AGENTS.md"
+            issues = grok_enforcement_issues()
+            # Only warn "missing" when the project looks Grok-bootstrapped;
+            # always warn on stale/broken paths if the file exists.
+            if issues:
+                missing_only = all(i.startswith("missing ") for i in issues)
+                if not missing_only or agents_md.is_file():
+                    for _label, _detail in grok_enforcement_report():
+                        warn(_label, _detail)
+        except Exception as e:  # advisory — doctor must never crash here
+            warn("hooks: grok enforcement check ran", f"skipped ({e})")
 
         # 2. Unicode
         stdout_enc = getattr(sys.stdout, "encoding", "unknown") or "unknown"
